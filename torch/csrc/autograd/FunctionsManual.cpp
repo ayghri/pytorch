@@ -1922,27 +1922,22 @@ Tensor cholesky_backward(const Tensor& gL, bool upper, const Tensor& L) {
   at::NoTF32Guard disable_tf32;
   // From cholesky_jvp we have that
   // dL = L\pi(L^{-1}dA(L^-H))
-  //
   // Let gL be the projection into the lower-triangular gradient wrt L. Taking
-  // adjoints we have gA = L^{-H}\pi^*((L^HgL).tril())L^{-1} where \pi^*(X) =
-  // 0.5 * (X + X^H - diag(X)) The only non-standard point of this derivation is
-  // noting that the adjoint to multiplying on the left by a lower triangular
-  // matrix L is multiplying by L^H and then projecting back to the lower
-  // triangular matrices (hence the .tril() projection) Note that the gradient
-  // is symmetric and not triangular.
+  // adjoints we have gA_asym = L^{-H}\pi(L^H gL)L^{-1} where \pi as seen in
+  // cholesky_jvp but since A is symmetric, we have to use:
+  // gA = gA_asym + gA_asym^H, and then scale the diagonal by 1/2
+  // to account for complex A.
+  // See Murray, Iain. "Differentiation of the Cholesky decomposition."
+  //                        arXiv preprint arXiv:1602.07527 (2016).
+  // Note that the gradient is symmetric and not triangular.
   auto L_ = upper ? L.mH() : L;
   auto gL_ = upper ? gL.mH() : gL;
-
-  // Nb. We don't need to compute gL_ = gL.tril() as
-  // tril(L^H gL) = tril(L^H (triu(gL, 1) + tril(gL)))
-  //              = tril(L^H tril(gL)) + tril(L^H triu(gL, 1))
-  //              = tril(L^H tril(gL))
-  // since tril(L^H triu(gL, 1)) = 0, as L^H triu(gL, 1) is upper triangular
-  auto gA = L_.mH().matmul(gL_).tril();
-  // Equivalent to 0.5 * (gA + gA^H - diag(gA))
-  gA = 0.5 * (gA + gA.tril(-1).mH());
+  auto gA = L_.mH().matmul(gL_);
+  gA = gA.tril() - gA.diagonal(0, -2, -1).mul(0.5).diag_embed();
   gA = at::linalg_solve_triangular(L_.mH(), gA, /*upper=*/true, /*left=*/true);
   gA = at::linalg_solve_triangular(L_, gA, /*upper=*/false, /*left=*/false);
+  gA = gA + gA.mH();
+  gA.diagonal(0, -2, -1).mul_(0.5);
   return gA;
 }
 
