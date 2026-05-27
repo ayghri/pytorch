@@ -1,12 +1,10 @@
 #include <c10/util/env.h>
-#include <torch/csrc/lazy/backend/backend_interface.h>
 #include <torch/csrc/lazy/core/cache.h>
 #include <torch/csrc/lazy/core/config.h>
 #include <torch/csrc/lazy/core/ir.h>
 #include <torch/csrc/lazy/core/ir_metadata.h>
 
 // Enables caching on for dynamic shapes (aka disable hash on shapes)
-// NOLINTNEXTLINE(misc-use-internal-linkage)
 // clang-format off
 C10_DEFINE_bool(
     ltc_enable_dynamic_shapes,
@@ -98,6 +96,16 @@ Node::Node(OpKind op, Shape shape, size_t num_outputs) : Node(op, num_outputs) {
   shapes_.push_back(std::move(shape));
 }
 
+Node::Node(const Node& rhs) = default;
+
+Node::Node(Node&& rhs) = default;
+
+Node::~Node() = default;
+
+Node& Node::operator=(const Node& rhs) = default;
+
+Node& Node::operator=(Node&& rhs) = default;
+
 // Retrieves the full shape of the IR Node.
 c10::ArrayRef<Shape> Node::shapes() const {
   return shapes_;
@@ -144,7 +152,7 @@ const Output& Node::nullable_operand(size_t i) const {
 
 std::string Node::ToString() const {
   std::stringstream ss;
-  ss << shapes() << " " << op();
+  ss << shapes() << ' ' << op();
   if (num_outputs() > 1) {
     ss << ", num_outputs=" << num_outputs();
   }

@@ -31,9 +31,15 @@ class Gumbel(TransformedDistribution):
     """
 
     arg_constraints = {"loc": constraints.real, "scale": constraints.positive}
+    # pyrefly: ignore [bad-override]
     support = constraints.real
 
-    def __init__(self, loc, scale, validate_args=None):
+    def __init__(
+        self,
+        loc: Tensor | float,
+        scale: Tensor | float,
+        validate_args: bool | None = None,
+    ) -> None:
         self.loc, self.scale = broadcast_all(loc, scale)
         finfo = torch.finfo(self.loc.dtype)
         if isinstance(loc, _Number) and isinstance(scale, _Number):

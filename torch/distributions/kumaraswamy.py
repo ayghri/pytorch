@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+
 import torch
 from torch import nan, Tensor
 from torch.distributions import constraints
@@ -42,10 +43,16 @@ class Kumaraswamy(TransformedDistribution):
         "concentration1": constraints.positive,
         "concentration0": constraints.positive,
     }
+    # pyrefly: ignore [bad-override]
     support = constraints.unit_interval
     has_rsample = True
 
-    def __init__(self, concentration1, concentration0, validate_args=None):
+    def __init__(
+        self,
+        concentration1: Tensor | float,
+        concentration0: Tensor | float,
+        validate_args: bool | None = None,
+    ) -> None:
         self.concentration1, self.concentration0 = broadcast_all(
             concentration1, concentration0
         )
@@ -59,6 +66,7 @@ class Kumaraswamy(TransformedDistribution):
             AffineTransform(loc=1.0, scale=-1.0),
             PowerTransform(exponent=self.concentration1.reciprocal()),
         ]
+        # pyrefly: ignore [bad-argument-type]
         super().__init__(base_dist, transforms, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):

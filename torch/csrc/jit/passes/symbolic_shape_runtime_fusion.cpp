@@ -1,7 +1,6 @@
 #include <ATen/core/functional.h>
 #include <ATen/core/interned_strings.h>
 #include <c10/core/MemoryFormat.h>
-#include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/ir/ir_views.h>
@@ -69,7 +68,7 @@ static std::map<int64_t, Value*> InsertSymbolicShapesCompute(
   return sym_shape_to_enclosing_graph_value;
 }
 
-void insertDynamicShapesGuard(
+static void insertDynamicShapesGuard(
     const ShapeComputeGraphMapping& shape_mapping,
     Node* guarded_node,
     bool add_composed_op,
@@ -115,7 +114,7 @@ StrideInput strideInputFromString(const std::string& si) {
 // in the runtime guard, strides are serialized as one flat
 // vector. stride_inputs_offset indexes into that vector
 // where the strides of this tensor begin
-inline StrideInput summarizeStrideDim(
+static inline StrideInput summarizeStrideDim(
     const c10::IntArrayRef sizes,
     const c10::IntArrayRef strides,
     size_t dim,
@@ -216,12 +215,11 @@ static void moveConstantTensorsOutOfSubgraph(
     const std::shared_ptr<Graph>& tensorexpr_graph) {
   auto parent = tensorexpr_graph_node->owningGraph();
 
-  auto env = [&](Value* v) {
+  auto env = [&](Value* v) -> Value* {
     TORCH_INTERNAL_ASSERT(
         false,
         "this should never happen since constant nodes do not have any inputs",
         v->debugName());
-    return v;
   };
 
   WithInsertPoint wip(tensorexpr_graph_node);
@@ -517,7 +515,7 @@ static Operation StaticRuntimeCopyOuts(const Node* node) {
   };
 }
 
-RegisterOperators SRCopyOuts({
+static RegisterOperators SRCopyOuts({
     torch::jit::Operator(
         prim::StaticRuntimeCopyOuts,
         StaticRuntimeCopyOuts,
@@ -529,7 +527,7 @@ RegisterOperators SRCopyOuts({
 // and also the that the symbolic shape dimensions are observed.
 // For any symbolic dimension we need to set its value on its first
 // use and for all subsequent uses check that the values are equal
-RegisterOperators reg_guard({
+static RegisterOperators reg_guard({
     Operator(
         "prim::TensorExprDynamicGuard(...) -> bool",
         [](const Node* node) -> Operation {
@@ -610,8 +608,7 @@ RegisterOperators reg_guard({
                   flattened_input_dims,
                   flattened_input_striding,
                   num_symbolic_dims](Stack& stack) {
-            at::ArrayRef<IValue> inputs = last(stack, num_inputs);
-            drop(stack, num_inputs);
+            auto inputs = pop(stack, num_inputs);
             // each invocation we need to reset what value of each symbolic
             // symbol is.
             // TODO: could this be a reference and not allocated on
@@ -736,7 +733,7 @@ static Operation createTensorExprDynamicGroup(const Node* node) {
   };
 }
 
-RegisterOperators TensorExprDynamicOp({
+static RegisterOperators TensorExprDynamicOp({
     torch::jit::Operator(
         prim::TensorExprDynamicGroup,
         createTensorExprDynamicGroup,

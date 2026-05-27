@@ -12,11 +12,7 @@
 #include <torch/csrc/jit/passes/shape_analysis.h>
 #include <torch/csrc/jit/passes/symbolic_shape_analysis.h>
 #include <torch/csrc/jit/python/pybind.h>
-#include <torch/csrc/jit/python/python_tracer.h>
-#include <torch/csrc/jit/runtime/argument_spec.h>
 #include <torch/csrc/jit/serialization/export.h>
-#include <torch/csrc/jit/serialization/python_print.h>
-#include <torch/csrc/python_headers.h>
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_strings.h>
 #include <iostream>
@@ -26,13 +22,13 @@
 namespace torch::jit {
 
 // Controls whether graph source ranges are printed by default
-bool global_print_source_ranges = true;
+static bool global_print_source_ranges = true;
 
 Symbol ConcretePythonOp::Kind = prim::PythonOp;
 
 using c10::Type;
 
-std::string getPythonName(const PyObject* obj_) {
+static std::string getPythonName(const PyObject* obj_) {
   pybind11::gil_scoped_acquire gil;
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
   PyObject* obj = const_cast<PyObject*>(obj_);
@@ -41,7 +37,7 @@ std::string getPythonName(const PyObject* obj_) {
   return py::str(v);
 }
 
-std::ostream& printPyObject(std::ostream& out, const THPObjectPtr& obj) {
+static std::ostream& printPyObject(std::ostream& out, const THPObjectPtr& obj) {
   pybind11::gil_scoped_acquire gil;
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
   auto pyobj = py::handle(const_cast<PyObject*>(obj.get()));
@@ -61,7 +57,7 @@ std::ostream& printPyObject(std::ostream& out, const THPObjectPtr& obj) {
     // tuple.__str__; this doesn't work because Python doesn't allow
     // monkeypatching methods of built-in types.
     auto pytuple = pyobj.cast<py::tuple>();
-    out << "(";
+    out << '(';
     size_t i = 0;
     for (const auto& o : pytuple) {
       if (i > 0) {
@@ -72,16 +68,16 @@ std::ostream& printPyObject(std::ostream& out, const THPObjectPtr& obj) {
       i++;
     }
     if (i == 1) {
-      out << ",";
+      out << ',';
     }
-    out << ")";
+    out << ')';
     return out;
   } else {
     return out << THPUtils_unpackString(py::str(pyobj).ptr());
   }
 }
 
-Node* findNode(
+static Node* findNode(
     c10::ArrayRef<torch::jit::Block*> blocks,
     Symbol kind,
     bool recurse = true) {
@@ -101,7 +97,7 @@ Node* findNode(
   return nullptr;
 }
 
-Node* findNode(Block* block, Symbol kind, bool recurse = true) {
+static Node* findNode(Block* block, Symbol kind, bool recurse = true) {
   std::vector<Block*> blocks = {block};
   return findNode(blocks, kind, recurse);
 }
@@ -154,14 +150,14 @@ std::optional<THPObjectPtr> ConcretePythonOp::autogradFunction() const {
 }
 
 void ConcretePythonOp::writeScalars(std::ostream& out) const {
-  out << "(";
+  out << '(';
   int i = 0;
   for (auto& scalar : scalar_args) {
     if (i++ > 0)
       out << ", ";
     printPyObject(out, scalar);
   }
-  out << ")";
+  out << ')';
 }
 
 void ConcretePythonOp::lint_python() const {
@@ -506,7 +502,7 @@ void initPythonIRBindings(PyObject* module_) {
           "__repr__",
           [](Value& n) {
             std::stringstream ss;
-            ss << n.debugName() << " defined in (" << *n.node() << ")";
+            ss << n.debugName() << " defined in (" << *n.node() << ')';
             return ss.str();
           })
       .VS(type)
@@ -906,7 +902,7 @@ void initPythonIRBindings(PyObject* module_) {
           "scalarType",
           [](Type& t) {
             auto scalar_type = t.expectRef<TensorType>().scalarType();
-            return (scalar_type) ? toString(*scalar_type) : nullptr;
+            return scalar_type ? toString(*scalar_type) : nullptr;
           })
       .def(
           "device",

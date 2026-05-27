@@ -1,119 +1,713 @@
+#include <c10/metal/indexing.h>
 #include <c10/metal/special_math.h>
 #include <c10/metal/utils.h>
 #include <metal_stdlib>
 using namespace metal;
 using namespace c10::metal;
 
-template <typename T0, typename T1>
-kernel void erfinv_kernel(
-    device T0* output [[buffer(0)]],
-    constant T1* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = T0(erfinv(input[index]));
+struct angle_functor {
+  template <typename T, enable_if_t<is_complex_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return T(atan2(x.y, x.x), 0);
+  }
+  template <typename T, enable_if_t<is_scalar_floating_point_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return T(isnan(x) ? x : x < 0 ? M_PI_F : 0.0);
+  }
+  template <typename T, enable_if_t<is_scalar_integral_v<T>, bool> = true>
+  inline float operator()(const T x) {
+    return x < 0 ? M_PI_F : 0.0;
+  }
+};
+
+// Implement exp wrapper for both real and complex types
+template <typename T, enable_if_t<is_scalar_floating_point_v<T>, bool> = true>
+inline T exp_(const T x) {
+  return T(precise::exp(x));
 }
 
-template <typename T0, typename T1>
-kernel void exp_kernel(
-    device T0* output [[buffer(0)]],
-    constant T1* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = T0(precise::exp(input[index]));
+template <typename T, enable_if_t<is_complex_v<T>, bool> = true>
+inline T exp_(const T x) {
+  auto ex = precise::exp(x.x);
+  // y == 0: avoid inf*0 / nan*0 = NaN in imag (matches C99 cexp).
+  if (x.y == 0) {
+    return T(ex, 0);
+  }
+  // Metal lacks a half sincos; do it in float (free for float complex, more
+  // accurate for half complex).
+  float c;
+  float s = precise::sincos(static_cast<float>(x.y), c);
+  return T(
+      ex * static_cast<decltype(ex)>(c), ex * static_cast<decltype(ex)>(s));
 }
 
-template <typename T0>
-kernel void exp_complex_kernel(
-    device vec2type_t<T0>* output [[buffer(0)]],
-    constant vec2type_t<T0>* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index].x =
-      T0(precise::exp(input[index].x) * precise::cos(input[index].y));
-  output[index].y =
-      T0(precise::exp(input[index].x) * precise::sin(input[index].y));
-}
+struct exp_functor {
+  template <typename T, enable_if_t<is_floating_point_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return exp_(x);
+  }
+  template <typename T, enable_if_t<is_scalar_integral_v<T>, bool> = true>
+  inline float operator()(const T x) {
+    return exp_(static_cast<float>(x));
+  }
+};
 
-template <typename T0, typename T1>
-kernel void tanh_kernel(
-    device T0* output [[buffer(0)]],
-    constant T1* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = T0(precise::tanh(input[index]));
-}
+struct expm1_functor {
+  template <typename T, enable_if_t<is_scalar_floating_point_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    if (::metal::fabs(x) < 1e-5f) {
+      return static_cast<T>(c10::metal::expm1f(static_cast<float>(x)));
+    } else {
+      return static_cast<T>(exp_(static_cast<float>(x)) - 1.0f);
+    }
+  }
+  template <typename T, enable_if_t<is_scalar_integral_v<T>, bool> = true>
+  inline float operator()(const T x) {
+    return exp_(static_cast<float>(x)) - 1;
+  }
+  template <typename T, enable_if_t<is_complex_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    // y == 0: same rationale as exp_ short-circuit above.
+    if (x.y == 0) {
+      return T(c10::metal::expm1f(x.x), 0);
+    }
+    if (::precise::sqrt(dot(x, x)) < 1e-2) {
+      float c;
+      float s = precise::sincos(static_cast<float>(x.y), c);
+      using elem_t = decltype(x.x + x.x); // unwrapped value type
+      return T(
+          c10::metal::expm1f(x.x + ::precise::log(static_cast<elem_t>(c))),
+          exp_(x.x) * static_cast<elem_t>(s));
+    } else {
+      return exp_(x) - T(1.0f, 0.0f);
+    }
+  }
+};
 
-template <typename T0, typename T1>
-kernel void sqrt_kernel(
-    device T0* output [[buffer(0)]],
-    constant T1* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = T0(precise::sqrt(input[index]));
-}
+struct sigmoid_functor {
+  template <typename T, enable_if_t<is_scalar_floating_point_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return T(1.0f / (1.0f + exp_(-static_cast<float>(x))));
+  }
+  template <typename T, enable_if_t<is_complex_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return c10::metal::div(T(1, 0), (T(1, 0) + exp_(-x)));
+  }
+  template <typename T, enable_if_t<is_scalar_integral_v<T>, bool> = true>
+  inline float operator()(const T x) {
+    return 1.0f / (1.0f + exp_(-static_cast<float>(x)));
+  }
+};
 
-template <typename T0>
-kernel void sqrt_complex_kernel(
-    device vec2type_t<T0>* output [[buffer(0)]],
-    constant vec2type_t<T0>* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  T0 a = input[index].x;
-  T0 b = input[index].y;
+struct abs_functor {
+  template <typename T, enable_if_t<!is_complex_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return static_cast<T>(precise::abs(x));
+  }
+  template <typename T, enable_if_t<is_complex_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    const auto abs_2 = ::precise::abs(float2(x));
+    return T(c10::metal::hypot(abs_2.x, abs_2.y));
+  }
+};
 
-  // modulus
-  auto m = precise::sqrt(a * a + b * b);
-  // real part: sqrt((m + a)/2)
-  auto real_part = precise::sqrt((m + a) * .5);
-  // imaginary part: sign(b) * sqrt((m - a)/2)
-  auto imag_part = copysign(static_cast<T0>(precise::sqrt((m - a) * .5)), b);
-  output[index] = vec2type_t<T0>(real_part, imag_part);
-}
+struct sin_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::sin(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::sin(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // sin(x+yi)=sin(x)cosh(y)+icos(x)sinh(y); float sincos covers half too.
+    float cos_x;
+    float sin_x = precise::sincos(static_cast<float>(x.x), cos_x);
+    using elem_t = decltype(x.x + x.x);
+    return T(
+        static_cast<elem_t>(sin_x) * precise::cosh(x.y),
+        static_cast<elem_t>(cos_x) * precise::sinh(x.y));
+  }
+};
 
-#if __METAL_VERSION__ >= 310
-bfloat dot(bfloat2 a, bfloat2 b) {
-  return a.x * b.x + a.y * b.y;
-}
-#endif
+struct cos_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::cos(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::cos(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // cos(x+yi)=cos(x)cosh(y)-isin(x)sinh(y); float sincos covers half too.
+    float cos_x;
+    float sin_x = precise::sincos(static_cast<float>(x.x), cos_x);
+    using elem_t = decltype(x.x + x.x);
+    return T(
+        static_cast<elem_t>(cos_x) * precise::cosh(x.y),
+        -static_cast<elem_t>(sin_x) * precise::sinh(x.y));
+  }
+};
 
-short dot(short2 a, short2 b) {
-  return a.x * b.x + a.y * b.y;
-}
+struct tan_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::tan(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::tan(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // tan(x+yi)=(tan(x) + itanh(y)) / (1 - i(tan(x) * tanh(y)))
+    auto tan_x = precise::tan(x.x);
+    auto tanh_y = precise::tanh(x.y);
+    return div(T(tan_x, tanh_y), T(1, -1 * tan_x * tanh_y));
+  }
+};
 
-template <typename T>
-T complex_div(T a, T b) {
-  auto denom = dot(b, b);
-  return T(dot(a, b), a.y * b.x - a.x * b.y) / denom;
-}
+struct sinh_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::sinh(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::sinh(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // sinh(x) = (e^x - e^(-x)) / 2; delegate to exp_ to inherit y==0 fix.
+    return div(exp_(x) - exp_(T(-x.x, -x.y)), T(2, 0));
+  }
+};
 
-template <typename T0>
-kernel void tanh_complex_kernel(
-    device vec2type_t<T0>* output [[buffer(0)]],
-    constant vec2type_t<T0>* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  // tanh(x+iy)=(tanh(x)+itan(y))/(1+itahnh(x)*tan(y));
-  auto tanh_x = T0(precise::tanh(input[index].x));
-  auto tan_y = T0(precise::tan(input[index].y));
-  output[index] = complex_div(
-      vec2type_t<T0>(tanh_x, tan_y), vec2type_t<T0>(T0(1), tanh_x * tan_y));
-}
+struct cosh_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::cosh(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::cosh(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // cosh(x+iy) = (e^x + e^(-x)) / 2; delegate to exp_ to inherit y==0 fix.
+    return div(exp_(x) + exp_(T(-x.x, -x.y)), T(2, 0));
+  }
+};
 
-#define INSTANTIATE_UNARY_KERNELS2(DTYPE0, DTYPE1)                             \
-  template [[host_name("erfinv_" #DTYPE0 "_" #DTYPE1)]] kernel void            \
-  erfinv_kernel(                                                               \
-      device DTYPE0* output [[buffer(0)]],                                     \
-      constant DTYPE1* input [[buffer(1)]],                                    \
-      uint id [[thread_position_in_grid]]);                                    \
-  template [[host_name("exp_" #DTYPE0 "_" #DTYPE1)]] kernel void exp_kernel(   \
-      device DTYPE0* output [[buffer(0)]],                                     \
-      constant DTYPE1* input [[buffer(1)]],                                    \
-      uint id [[thread_position_in_grid]]);                                    \
-  template [[host_name("sqrt_" #DTYPE0 "_" #DTYPE1)]] kernel void sqrt_kernel( \
-      device DTYPE0* output [[buffer(0)]],                                     \
-      constant DTYPE1* input [[buffer(1)]],                                    \
-      uint id [[thread_position_in_grid]]);                                    \
-  template [[host_name("tanh_" #DTYPE0 "_" #DTYPE1)]] kernel void tanh_kernel( \
-      device DTYPE0* output [[buffer(0)]],                                     \
-      constant DTYPE1* input [[buffer(1)]],                                    \
-      uint id [[thread_position_in_grid]]);
+struct tanh_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::tanh(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::tanh(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // tanh(x+iy)=(tanh(x)+itan(y))/(1+itahnh(x)*tan(y));
+    auto tanh_x = precise::tanh(x.x);
+    auto tan_y = precise::tan(x.y);
+    return div(T(tanh_x, tan_y), T(1.0, tanh_x * tan_y));
+  }
+};
 
-#if __METAL_VERSION__ >= 310
+struct asin_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::asin(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::asin(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // asin(z) = atan(z/sqrt(1-z^2)) if z != ±1
+    if (x.x == 1 && x.y == 0)
+      return T(M_PI_F / 2, 0);
+    else if (x.x == -1 && x.y == 0)
+      return T(M_PI_F / -2, 0);
+    auto sqrt_val = T(1, 0) - c10::metal::mul(x, x);
+    // calculate sqrt
+    // modulus
+    auto m = precise::sqrt(sqrt_val.x * sqrt_val.x + sqrt_val.y * sqrt_val.y);
+    // real part: sqrt((m + a)/2)
+    auto real_part = precise::sqrt((m + sqrt_val.x) * .5);
+    // imaginary part: sign(b) * sqrt((m - a)/2)
+    auto imag_part = copysign(
+        static_cast<decltype(x.y)>(precise::sqrt((m - sqrt_val.x) * .5)),
+        sqrt_val.y);
+    auto atan_val = div(x, T(real_part, imag_part));
+    // calculate atan (see atan_functor)
+    auto coef = div(T(1, 0), T(0, 2));
+    auto log_arg =
+        div(T(-1 * atan_val.x, 1 - atan_val.y), T(atan_val.x, 1 + atan_val.y));
+    // Calculate log using method from log_functor
+    auto magnitude =
+        ::precise::sqrt(log_arg.x * log_arg.x + log_arg.y * log_arg.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (log_arg.x == 0 && log_arg.y == 0)
+        ? 0
+        : ::precise::atan2(log_arg.y, log_arg.x);
+    // return coefficient * log value
+    return c10::metal::mul(coef, T(real, imag));
+  }
+};
+
+struct acos_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::acos(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::acos(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // acos(z) = pi/2 - asin(z) if z != ±1
+    // calculate asin
+    if (x.x == 1 && x.y == 0)
+      return T(M_PI_F, 0);
+    else if (x.x == -1 && x.y == 0)
+      return T(-M_PI_F, 0);
+    auto sqrt_val = T(1, 0) - c10::metal::mul(x, x);
+    // calculate sqrt
+    // modulus
+    auto m = precise::sqrt(sqrt_val.x * sqrt_val.x + sqrt_val.y * sqrt_val.y);
+    // real part: sqrt((m + a)/2)
+    auto real_part = precise::sqrt((m + sqrt_val.x) * .5);
+    // imaginary part: sign(b) * sqrt((m - a)/2)
+    auto imag_part = copysign(
+        static_cast<decltype(x.y)>(precise::sqrt((m - sqrt_val.x) * .5)),
+        sqrt_val.y);
+    auto atan_val = div(x, T(real_part, imag_part));
+    // calculate atan (see atan_functor)
+    auto coef = div(T(1, 0), T(0, 2));
+    auto log_arg =
+        div(T(-1 * atan_val.x, 1 - atan_val.y), T(atan_val.x, 1 + atan_val.y));
+    // Calculate log using method from log_functor
+    auto magnitude =
+        ::precise::sqrt(log_arg.x * log_arg.x + log_arg.y * log_arg.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (log_arg.x == 0 && log_arg.y == 0)
+        ? 0
+        : ::precise::atan2(log_arg.y, log_arg.x);
+    // return coefficient * log value
+    return T(M_PI_F / 2, 0) - c10::metal::mul(coef, T(real, imag));
+  }
+};
+
+struct atan_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(precise::atan(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return precise::atan(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // atan(z) = (1/2i)ln((i-z)/(i+z))
+    auto coef = div(T(1, 0), T(0, 2));
+    auto log_arg = div(T(-1 * x.x, 1 - x.y), T(x.x, 1 + x.y));
+    // Calculate log using method from log_functor
+    auto magnitude =
+        ::precise::sqrt(log_arg.x * log_arg.x + log_arg.y * log_arg.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (log_arg.x == 0 && log_arg.y == 0)
+        ? 0
+        : ::precise::atan2(log_arg.y, log_arg.x);
+    // return coefficient * log value
+    return c10::metal::mul(coef, T(real, imag));
+  }
+};
+
+// Bool specialization is need to workaround compiler crashes on MacOS-13
+// Otherwise attempts to invoke will fail to create state object with error
+// Error Domain=AGXMetal13_3 Code=3 "Compiler encountered an internal error"
+
+struct log_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(::precise::log(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return ::precise::log(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // log(x+yi) = ln(sqrt(x^2 + y^2)) + iarctan(y/x)
+    auto magnitude = ::precise::sqrt(x.x * x.x + x.y * x.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (x.x == 0 && x.y == 0) ? 0 : ::precise::atan2(x.y, x.x);
+    return T(real, imag);
+  }
+  inline float operator()(const bool x) {
+    return x ? 0 : -INFINITY;
+  }
+};
+
+struct log10_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(::precise::log10(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return ::precise::log10(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // Base 10 complex log = ln(x+yi)/ln(10)
+    auto magnitude = ::precise::sqrt(x.x * x.x + x.y * x.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (x.x == 0 && x.y == 0) ? 0 : ::precise::atan2(x.y, x.x);
+    constexpr float inv_log_base = 1.0f / M_LN10_F;
+    return T(inv_log_base * real, inv_log_base * imag);
+  }
+  inline float operator()(const bool x) {
+    return x ? 0 : -INFINITY;
+  }
+};
+
+struct log1p_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(::c10::metal::log1p(float(x)));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return ::precise::log(1.0f + static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // TODO: Implement proper log1p algorithm
+    auto magnitude = ::precise::sqrt((1.0f + x.x) * (1.0f + x.x) + x.y * x.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (x.x == -1 && x.y == 0) ? 0 : ::precise::atan2(x.y, 1.0 + x.x);
+    return T(real, imag);
+  }
+  inline float operator()(const bool x) {
+    return x ? M_LN2_F : 0;
+  }
+};
+
+struct log2_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(::precise::log2(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return ::precise::log2(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // Base 2 complex log = ln(x+yi)/ln(2)
+    auto magnitude = ::precise::sqrt(x.x * x.x + x.y * x.y);
+    auto real = ::precise::log(magnitude);
+    auto imag = (x.x == 0 && x.y == 0) ? 0 : ::precise::atan2(x.y, x.x);
+    constexpr float inv_log_base = 1.0f / M_LN2_F;
+    return T(inv_log_base * real, inv_log_base * imag);
+  }
+  inline float operator()(const bool x) {
+    return x ? 0 : -INFINITY;
+  }
+};
+
+struct lgamma_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return static_cast<T>(c10::metal::log_gamma(static_cast<float>(x)));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return c10::metal::log_gamma(static_cast<float>(x));
+  }
+  inline float operator()(const bool x) {
+    return x ? 0 : INFINITY;
+  }
+};
+
+struct digamma_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return static_cast<T>(c10::metal::digamma(static_cast<float>(x)));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return c10::metal::digamma(static_cast<float>(x));
+  }
+  inline float operator()(const bool x) {
+    return c10::metal::digamma(static_cast<float>(x));
+  }
+};
+
+struct trigamma_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return static_cast<T>(c10::metal::trigamma(static_cast<float>(x)));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return c10::metal::trigamma(static_cast<float>(x));
+  }
+  inline float operator()(const bool x) {
+    return c10::metal::trigamma(static_cast<float>(x));
+  }
+};
+
+struct polygamma_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(
+      const T x,
+      const int order) {
+    return static_cast<T>(c10::metal::polygamma(order, static_cast<float>(x)));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(
+      const T x,
+      const int order) {
+    return c10::metal::polygamma(order, static_cast<float>(x));
+  }
+  inline float operator()(const bool x, const int order) {
+    return c10::metal::polygamma(order, static_cast<float>(x));
+  }
+};
+
+struct exp2_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(::precise::pow(2, x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return ::precise::pow(2, static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // based on https://mathworld.wolfram.com/ComplexExponentiation.html
+    auto coef = ::precise::pow(2, x.x);
+    // y == 0: same rationale as exp_ short-circuit (avoid coef*0 = NaN).
+    if (x.y == 0) {
+      return T(coef, 0);
+    }
+    float real;
+    float imag = ::precise::sincos(static_cast<float>(x.y) * M_LN2_F, real);
+    using elem_t = decltype(x.x + x.x);
+    return T(
+        coef * static_cast<elem_t>(real), coef * static_cast<elem_t>(imag));
+  }
+};
+
+struct sqrt_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(::precise::sqrt(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return ::precise::sqrt(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // modulus
+    auto m = precise::sqrt(x.x * x.x + x.y * x.y);
+    // real part: sqrt((m + a)/2)
+    auto real_part = precise::sqrt((m + x.x) * .5);
+    // imaginary part: sign(b) * sqrt((m - a)/2)
+    auto imag_part = copysign(
+        static_cast<decltype(x.y)>(precise::sqrt((m - x.x) * .5)), x.y);
+    return T(real_part, imag_part);
+  }
+};
+
+struct sqr_functor {
+  template <typename T>
+  inline T operator()(const T x) {
+    return c10::metal::mul(x, x);
+  }
+};
+
+struct reciprocal_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(1.0 / float(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return 1.0 / float(x);
+  }
+  template <typename T, enable_if_t<is_complex_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return c10::metal::div(T(1, 0), x);
+  }
+};
+
+struct rsqrt_functor {
+  template <typename T>
+  inline enable_if_t<is_scalar_floating_point_v<T>, T> operator()(const T x) {
+    return T(1 / ::precise::sqrt(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_scalar_integral_v<T>, float> operator()(const T x) {
+    return 1 / ::precise::sqrt(static_cast<float>(x));
+  }
+  template <typename T>
+  inline enable_if_t<is_complex_v<T>, T> operator()(const T x) {
+    // modulus
+    auto m = precise::sqrt(x.x * x.x + x.y * x.y);
+    // real part: sqrt((m + a)/2)
+    auto real_part = precise::sqrt((m + x.x) * .5);
+    // imaginary part: sign(b) * sqrt((m - a)/2)
+    auto imag_part = copysign(
+        static_cast<decltype(x.y)>(precise::sqrt((m - x.x) * .5)), x.y);
+    auto denominator = (real_part * real_part) + (imag_part * imag_part);
+    return T(real_part / denominator, -1 * imag_part / denominator);
+  }
+};
+
+struct neg_functor {
+  template <typename T>
+  inline T operator()(const T x) {
+    return T(-1 * x);
+  }
+};
+
+struct bitwise_not_functor {
+  template <typename T>
+  inline enable_if_t<!is_same_v<T, bool> && is_scalar_integral_v<T>, T>
+  operator()(const T x) {
+    return ~x;
+  }
+
+  template <typename T>
+  inline enable_if_t<is_same_v<T, bool>, T> operator()(const T x) {
+    return !x;
+  }
+};
+
+struct round_decimals_functor {
+  template <typename T>
+  inline T operator()(const T x, const long ndigits) {
+    return static_cast<T>(
+        rint(exp10(float(ndigits)) * x) * exp10(float(-ndigits)));
+  }
+};
+
+struct pow_scalar_functor {
+  template <typename T, typename U>
+  inline T operator()(const T x, const U y) {
+    return static_cast<T>(::c10::metal::pow(x, y));
+  }
+};
+
+struct round_functor {
+  template <typename T, enable_if_t<is_floating_point_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return static_cast<T>(rint(float(x)));
+  }
+  template <typename T, enable_if_t<is_scalar_integral_v<T>, bool> = true>
+  inline T operator()(const T x) {
+    return x;
+  }
+};
+
+DEFINE_UNARY_FLOATING_FUNCTOR(erf);
+DEFINE_UNARY_FLOATING_FUNCTOR(erfc);
+DEFINE_UNARY_FLOATING_FUNCTOR(erfcx);
+DEFINE_UNARY_FLOATING_FUNCTOR(erfinv);
+DEFINE_UNARY_FLOATING_FUNCTOR(sinc);
+
+REGISTER_UNARY_OP(neg, int, int);
+REGISTER_UNARY_OP(neg, long, long);
+REGISTER_UNARY_OP(neg, short, short);
+REGISTER_UNARY_OP(neg, char, char);
+REGISTER_UNARY_OP(neg, uchar, uchar);
+REGISTER_UNARY_OP(neg, float, float);
+REGISTER_UNARY_OP(neg, half, half);
+REGISTER_UNARY_OP(round, int, int);
+REGISTER_UNARY_OP(round, long, long);
+REGISTER_UNARY_OP(round, short, short);
+REGISTER_UNARY_OP(round, char, char);
+REGISTER_UNARY_OP(round, uchar, uchar);
+REGISTER_UNARY_OP(round, float, float);
+REGISTER_UNARY_OP(round, half, half);
+
+REGISTER_UNARY_OP(sqr, char, char);
+REGISTER_UNARY_OP(sqr, uchar, uchar);
+REGISTER_UNARY_OP(sqr, short, short);
+REGISTER_UNARY_OP(sqr, int, int);
+REGISTER_UNARY_OP(sqr, long, long);
+REGISTER_UNARY_OP(sqr, float, float);
+REGISTER_UNARY_OP(sqr, bfloat, bfloat);
+REGISTER_UNARY_OP(sqr, half, half);
+REGISTER_UNARY_OP(sqr, float2, float2);
+REGISTER_UNARY_OP(sqr, half2, half2);
+
+REGISTER_UNARY_OP(bitwise_not, int, int);
+REGISTER_UNARY_OP(bitwise_not, long, long);
+REGISTER_UNARY_OP(bitwise_not, short, short);
+REGISTER_UNARY_OP(bitwise_not, char, char);
+REGISTER_UNARY_OP(bitwise_not, uchar, uchar);
+REGISTER_UNARY_OP(bitwise_not, bool, bool);
+
+REGISTER_UNARY_OP(abs, int, int);
+REGISTER_UNARY_OP(abs, long, long);
+REGISTER_UNARY_OP(abs, short, short);
+REGISTER_UNARY_OP(abs, char, char);
+REGISTER_UNARY_OP(abs, uchar, uchar);
+REGISTER_UNARY_OP(abs, float, float);
+REGISTER_UNARY_OP(abs, half, half);
+
+#define INSTANTIATE_UNARY_KERNELS2(DTYPE0, DTYPE1) \
+  REGISTER_UNARY_OP(angle, DTYPE1, DTYPE0);        \
+  REGISTER_UNARY_OP(erf, DTYPE1, DTYPE0);          \
+  REGISTER_UNARY_OP(erfc, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(erfcx, DTYPE1, DTYPE0);        \
+  REGISTER_UNARY_OP(erfinv, DTYPE1, DTYPE0);       \
+  REGISTER_UNARY_OP(exp, DTYPE1, DTYPE0);          \
+  REGISTER_UNARY_OP(expm1, DTYPE1, DTYPE0);        \
+  REGISTER_UNARY_OP(sigmoid, DTYPE1, DTYPE0);      \
+  REGISTER_UNARY_OP(exp2, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(log, DTYPE1, DTYPE0);          \
+  REGISTER_UNARY_OP(log10, DTYPE1, DTYPE0);        \
+  REGISTER_UNARY_OP(log1p, DTYPE1, DTYPE0);        \
+  REGISTER_UNARY_OP(log2, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(lgamma, DTYPE1, DTYPE0);       \
+  REGISTER_UNARY_OP(digamma, DTYPE1, DTYPE0);      \
+  REGISTER_UNARY_OP(trigamma, DTYPE1, DTYPE0);     \
+  REGISTER_UNARY_OP(sinc, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(sqrt, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(reciprocal, DTYPE1, DTYPE0);   \
+  REGISTER_UNARY_OP(rsqrt, DTYPE1, DTYPE0);        \
+  REGISTER_UNARY_OP(sinh, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(cosh, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(tanh, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(sin, DTYPE1, DTYPE0);          \
+  REGISTER_UNARY_OP(cos, DTYPE1, DTYPE0);          \
+  REGISTER_UNARY_OP(tan, DTYPE1, DTYPE0);          \
+  REGISTER_UNARY_OP(asin, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(acos, DTYPE1, DTYPE0);         \
+  REGISTER_UNARY_OP(atan, DTYPE1, DTYPE0)
+
 INSTANTIATE_UNARY_KERNELS2(bfloat, bfloat);
-#endif
+REGISTER_UNARY_OP(neg, bfloat, bfloat);
+REGISTER_UNARY_OP(round, bfloat, bfloat);
+REGISTER_UNARY_OP(abs, bfloat, bfloat);
 INSTANTIATE_UNARY_KERNELS2(half, half);
 INSTANTIATE_UNARY_KERNELS2(float, float);
 INSTANTIATE_UNARY_KERNELS2(float, bool);
@@ -123,89 +717,57 @@ INSTANTIATE_UNARY_KERNELS2(float, short);
 INSTANTIATE_UNARY_KERNELS2(float, int);
 INSTANTIATE_UNARY_KERNELS2(float, long);
 
-#define INSTANTIATE_UNARY_KERNELS_VEC2(DTYPE0, DTYPE1)                    \
-  template [[host_name("exp_complex_" #DTYPE0 "_" #DTYPE1)]] kernel void  \
-  exp_complex_kernel<DTYPE0>(                                             \
-      device vec2type_t<DTYPE0> * output [[buffer(0)]],                   \
-      constant vec2type_t<DTYPE0> * input [[buffer(1)]],                  \
-      uint did [[thread_position_in_grid]]);                              \
-  template [[host_name("tanh_complex_" #DTYPE0 "_" #DTYPE1)]] kernel void \
-  tanh_complex_kernel<DTYPE0>(                                            \
-      device vec2type_t<DTYPE0> * output [[buffer(0)]],                   \
-      constant vec2type_t<DTYPE0> * input [[buffer(1)]],                  \
-      uint did [[thread_position_in_grid]]);                              \
-  template [[host_name("sqrt_complex_" #DTYPE0 "_" #DTYPE1)]] kernel void \
-  sqrt_complex_kernel<DTYPE0>(                                            \
-      device vec2type_t<DTYPE0> * output [[buffer(0)]],                   \
-      constant vec2type_t<DTYPE0> * input [[buffer(1)]],                  \
-      uint did [[thread_position_in_grid]]);
+#define INSTANTIATE_UNARY_KERNELS_VEC2(DTYPE)        \
+  REGISTER_UNARY_OP(angle, DTYPE##2, DTYPE##2);      \
+  REGISTER_UNARY_OP(neg, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(exp, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(expm1, DTYPE##2, DTYPE##2);      \
+  REGISTER_UNARY_OP(sigmoid, DTYPE##2, DTYPE##2);    \
+  REGISTER_UNARY_OP(abs, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(exp2, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(log, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(log10, DTYPE##2, DTYPE##2);      \
+  REGISTER_UNARY_OP(log1p, DTYPE##2, DTYPE##2);      \
+  REGISTER_UNARY_OP(log2, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(sinh, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(cosh, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(tanh, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(sqrt, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(reciprocal, DTYPE##2, DTYPE##2); \
+  REGISTER_UNARY_OP(rsqrt, DTYPE##2, DTYPE##2);      \
+                                                     \
+  REGISTER_UNARY_OP(sinc, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(sin, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(cos, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(tan, DTYPE##2, DTYPE##2);        \
+  REGISTER_UNARY_OP(asin, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(acos, DTYPE##2, DTYPE##2);       \
+  REGISTER_UNARY_OP(atan, DTYPE##2, DTYPE##2)
 
-INSTANTIATE_UNARY_KERNELS_VEC2(half, half);
-INSTANTIATE_UNARY_KERNELS_VEC2(float, float);
+INSTANTIATE_UNARY_KERNELS_VEC2(half);
+INSTANTIATE_UNARY_KERNELS_VEC2(float);
 
-template <typename T0, typename T1>
-kernel void sinc_kernel(
-    device T0* output [[buffer(0)]],
-    constant T1* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = T0(sinc(static_cast<float>(input[index])));
-}
+REGISTER_UNARY_ALPHA_OP(round_decimals, float, long, float);
+REGISTER_UNARY_ALPHA_OP(round_decimals, half, long, half);
+REGISTER_UNARY_ALPHA_OP(round_decimals, bfloat, long, bfloat);
 
-template <typename T>
-kernel void sinc_complex(
-    device T* output [[buffer(0)]],
-    constant T* input [[buffer(1)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = T(sinc(float2(input[index])));
-}
+REGISTER_UNARY_ALPHA_OP(pow_scalar, float2, float2, float2);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, half2, float2, half2);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, float, float, float);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, half, float, half);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, bfloat, float, bfloat);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, uchar, int, uchar);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, char, int, char);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, short, int, short);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, int, int, int);
+REGISTER_UNARY_ALPHA_OP(pow_scalar, long, int, long);
 
-#define INSTANTIATE_SINC_KERNEL(DTYPE0, DTYPE1)                                \
-  template [[host_name("sinc_" #DTYPE0 "_" #DTYPE1)]] kernel void sinc_kernel( \
-      device DTYPE0* output [[buffer(0)]],                                     \
-      constant DTYPE1* input [[buffer(1)]],                                    \
-      uint id [[thread_position_in_grid]])
-
-#define INSTANTIATE_SINC_COMPLEX_KERNEL(DTYPE)                          \
-  template [[host_name("sinc_complex_" #DTYPE "_" #DTYPE)]] kernel void \
-  sinc_complex(                                                         \
-      device DTYPE##2 * output [[buffer(0)]],                           \
-      constant DTYPE##2 * input [[buffer(1)]],                          \
-      uint id [[thread_position_in_grid]])
-
-#if __METAL_VERSION__ >= 310
-INSTANTIATE_SINC_KERNEL(bfloat, bfloat);
-#endif
-INSTANTIATE_SINC_KERNEL(half, half);
-INSTANTIATE_SINC_KERNEL(float, float);
-INSTANTIATE_SINC_KERNEL(float, long);
-INSTANTIATE_SINC_KERNEL(float, int);
-INSTANTIATE_SINC_KERNEL(float, short);
-INSTANTIATE_SINC_KERNEL(float, char);
-INSTANTIATE_SINC_KERNEL(float, uchar);
-INSTANTIATE_SINC_KERNEL(float, bool);
-INSTANTIATE_SINC_COMPLEX_KERNEL(half);
-INSTANTIATE_SINC_COMPLEX_KERNEL(float);
-
-template <typename T>
-kernel void round_decimals_kernel(
-    device T* output [[buffer(0)]],
-    constant T* input [[buffer(1)]],
-    constant long& ndigits [[buffer(2)]],
-    uint index [[thread_position_in_grid]]) {
-  output[index] = static_cast<T>(
-      rint(exp10(float(ndigits)) * input[index]) * exp10(float(-ndigits)));
-}
-
-#define INSTANTIATE_ROUND_DECIMALS(DTYPE)                                 \
-  template [[host_name("round_decimals_" #DTYPE "_" #DTYPE)]] kernel void \
-  round_decimals_kernel(                                                  \
-      device DTYPE* output [[buffer(0)]],                                 \
-      constant DTYPE* input [[buffer(1)]],                                \
-      constant long& ndigits [[buffer(2)]],                               \
-      uint id [[thread_position_in_grid]])
-
-INSTANTIATE_ROUND_DECIMALS(float);
-INSTANTIATE_ROUND_DECIMALS(half);
-#if __METAL_VERSION__ >= 310
-INSTANTIATE_ROUND_DECIMALS(bfloat);
-#endif
+REGISTER_UNARY_ALPHA_OP(polygamma, bfloat, int, bfloat);
+REGISTER_UNARY_ALPHA_OP(polygamma, half, int, half);
+REGISTER_UNARY_ALPHA_OP(polygamma, float, int, float);
+REGISTER_UNARY_ALPHA_OP(polygamma, bool, int, float);
+REGISTER_UNARY_ALPHA_OP(polygamma, uchar, int, float);
+REGISTER_UNARY_ALPHA_OP(polygamma, char, int, float);
+REGISTER_UNARY_ALPHA_OP(polygamma, short, int, float);
+REGISTER_UNARY_ALPHA_OP(polygamma, int, int, float);
+REGISTER_UNARY_ALPHA_OP(polygamma, long, int, float);

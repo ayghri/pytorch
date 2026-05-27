@@ -1,5 +1,6 @@
 #include <torch/csrc/fx/node.h>
 
+#include <c10/util/Exception.h>
 #include <c10/util/SmallVector.h>
 #include <structmember.h>
 #include <torch/csrc/utils/object_ptr.h>
@@ -62,7 +63,7 @@ inline static PyObject* map_aggregate(PyObject* a, F fn) {
   // Case 1: a is a tuple.
   if (PyTuple_Check(a)) {
     Py_ssize_t n = PyTuple_GET_SIZE(a);
-    if (n == 0) {
+    if (n == 0 && PyTuple_CheckExact(a)) {
       return Py_NewRef(a);
     }
     THPObjectPtr new_tuple(PyTuple_New(n));
@@ -173,14 +174,33 @@ struct NodeBase {
     return *reinterpret_cast<NodeSortKey*>(sort_key_buf);
   }
 
+  inline void set_prev(NodeBase* value) {
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(value);
+    Py_INCREF(reinterpret_cast<PyObject*>(value));
+    NodeBase* old = _prev;
+    _prev = value;
+    Py_DECREF(reinterpret_cast<PyObject*>(old));
+  }
+
+  inline void set_next(NodeBase* value) {
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(value);
+    Py_INCREF(reinterpret_cast<PyObject*>(value));
+    NodeBase* old = _next;
+    _next = value;
+    Py_DECREF(reinterpret_cast<PyObject*>(old));
+  }
+
   // Equivalent to:
   //   p, n = self._prev, self._next
   //   p._next, n._prev = n, p
   inline void remove_from_list() {
+    if (this->_prev == this && this->_next == this) {
+      return;
+    }
     NodeBase* p = this->_prev;
     NodeBase* n = this->_next;
-    p->_next = n;
-    n->_prev = p;
+    p->set_next(n);
+    n->set_prev(p);
   }
 };
 
@@ -333,7 +353,7 @@ static PyObject* NodeBase__update_args_kwargs(
     Py_CLEAR(node->_kwargs);
     node->_kwargs = map_aggregate(args[1], visit_fn);
     Py_RETURN_NONE;
-  } catch (const PythonError& e) {
+  } catch (const PythonError&) {
     return nullptr;
   }
 }
@@ -343,6 +363,43 @@ static PyObject* NodeBase__remove_from_list(
     PyObject* _ignored) {
   reinterpret_cast<NodeBase*>(self)->remove_from_list();
   Py_RETURN_NONE;
+}
+
+static PyObject* NodeBase__replace_input_with(
+    PyObject* self,
+    PyObject* const* args,
+    Py_ssize_t nargs) {
+  if (nargs != 2) {
+    PyErr_SetString(
+        PyExc_TypeError,
+        "_replace_input_with() requires exactly 2 arguments (old_input, new_input)");
+    return nullptr;
+  }
+  PyObject* old_input = args[0];
+  PyObject* new_input = args[1];
+  auto replace_fn = [old_input, new_input](PyObject* maybe_node) {
+    if (maybe_node == old_input) {
+      return Py_NewRef(new_input);
+    }
+    return Py_NewRef(maybe_node);
+  };
+
+  auto node = reinterpret_cast<NodeBase*>(self);
+  try {
+    THPObjectPtr new_args(map_aggregate(node->_args, replace_fn));
+    if (!new_args) {
+      return nullptr;
+    }
+    THPObjectPtr new_kwargs(map_aggregate(node->_kwargs, replace_fn));
+    if (!new_kwargs) {
+      return nullptr;
+    }
+
+    PyObject* update_args[2] = {new_args.get(), new_kwargs.get()};
+    return NodeBase__update_args_kwargs(self, update_args, 2);
+  } catch (const PythonError&) {
+    return nullptr;
+  }
 }
 
 static PyObject* NodeBase__prepend(PyObject* self_, PyObject* arg) {
@@ -364,10 +421,10 @@ static PyObject* NodeBase__prepend(PyObject* self_, PyObject* arg) {
 
   x->remove_from_list();
   NodeBase* p = self->_prev;
-  p->_next = x;
-  x->_prev = p;
-  x->_next = self;
-  self->_prev = x;
+  p->set_next(x);
+  x->set_prev(p);
+  x->set_next(self);
+  self->set_prev(x);
 
   // Now compute x.sort_key()
   const NodeSortKey& psk = x->_prev->sort_key();
@@ -450,7 +507,11 @@ static PyObject* NodeBase_get_sort_key(PyObject* self, void* /*closure*/) {
     return nullptr; // Out of memory
   }
   for (Py_ssize_t i = 0; i < n; i++) {
-    PyTuple_SET_ITEM(tuple.get(), i, PyLong_FromSsize_t(vec[i]));
+    PyObject* value = PyLong_FromSsize_t(vec[i]);
+    if (!value) {
+      return nullptr;
+    }
+    PyTuple_SET_ITEM(tuple.get(), i, value);
   }
   return tuple.release();
 }
@@ -463,7 +524,7 @@ static int NodeBase_set_sort_key(
     void* /*closure*/) {
   NodeBase* node = reinterpret_cast<NodeBase*>(self);
   if (!PyTuple_Check(value)) {
-    PyErr_SetString(PyExc_TypeError, "_sort_key must be an tuple of ints");
+    PyErr_SetString(PyExc_TypeError, "_sort_key must be a tuple of ints");
     return -1;
   }
   Py_ssize_t size = PyTuple_GET_SIZE(value);
@@ -483,15 +544,19 @@ static int NodeBase_set_sort_key(
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 static PyMethodDef NodeBase_methods[] = {
     {"_update_args_kwargs",
-     (PyCFunction)(void*)(NodeBase__update_args_kwargs),
+     (PyCFunction)(void*)NodeBase__update_args_kwargs,
      METH_FASTCALL,
      "Internal method: do not call directly."},
     {"_remove_from_list",
-     (PyCFunction)(void*)(NodeBase__remove_from_list),
+     (PyCFunction)(void*)NodeBase__remove_from_list,
      METH_NOARGS,
      "Internal method: do not call directly."},
+    {"_replace_input_with",
+     (PyCFunction)(void*)NodeBase__replace_input_with,
+     METH_FASTCALL,
+     "Internal method: replace occurrences of one input Node with another."},
     {"_prepend",
-     (PyCFunction)(void*)(NodeBase__prepend),
+     (PyCFunction)(void*)NodeBase__prepend,
      METH_O,
      "Internal method: do not call directly."},
     {"__lt__",
@@ -528,7 +593,7 @@ PyTypeObject NodeBaseType = {
     "torch._C._NodeBase", /* tp_name */
     sizeof(NodeBase), /* tp_basicsize */
     0, /* tp_itemsize */
-    (destructor)NodeBase_dealloc, /* tp_dealloc */
+    NodeBase_dealloc, /* tp_dealloc */
     0, /* tp_vectorcall_offset */
     nullptr, /* tp_getattr */
     nullptr, /* tp_setattr */
@@ -612,7 +677,7 @@ static int NodeIter_init_fn(NodeIter* self, PyObject* args, PyObject* kwargs) {
 }
 
 template <bool reversed>
-PyObject* NodeIter_iternext_helper(NodeIter* self) {
+static PyObject* NodeIter_iternext_helper(NodeIter* self) {
   // It should be possible to relax the ref counting here
   // but in practice, we do not have that many _erased Nodes,
   // so probably not worth it.
@@ -627,8 +692,7 @@ PyObject* NodeIter_iternext_helper(NodeIter* self) {
   }
   while (self->_cur != self->_root) {
     if (!self->_cur->_erased) {
-      Py_INCREF(self->_cur);
-      return (PyObject*)self->_cur;
+      return Py_NewRef(self->_cur);
     }
     if constexpr (reversed) {
       NodeBase* prev = (NodeBase*)Py_NewRef(self->_cur->_prev);
@@ -644,7 +708,7 @@ PyObject* NodeIter_iternext_helper(NodeIter* self) {
   return nullptr;
 }
 
-PyObject* NodeIter_iternext(PyObject* _self) {
+static PyObject* NodeIter_iternext(PyObject* _self) {
   NodeIter* self = (NodeIter*)_self;
   if (self->_reversed) {
     return NodeIter_iternext_helper<true>(self);
@@ -737,7 +801,7 @@ static PyObject* py_map_aggregate(
     // args[0]: aggregate, args[1]: callable fn
     return map_aggregate(
         args[0], [fn](PyObject* a) { return PyObject_CallOneArg(fn, a); });
-  } catch (const PythonError& e) {
+  } catch (const PythonError&) {
     return nullptr; // error should already be set
   }
 }
@@ -759,7 +823,7 @@ static PyObject* py_map_arg(
       }
       return Py_NewRef(a);
     });
-  } catch (const PythonError& e) {
+  } catch (const PythonError&) {
     return nullptr; // error should already be set
   }
 }
@@ -767,11 +831,11 @@ static PyObject* py_map_arg(
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 static PyMethodDef extra_methods[] = {
     {"_fx_map_aggregate",
-     (PyCFunction)(void*)(py_map_aggregate),
+     (PyCFunction)(void*)py_map_aggregate,
      METH_FASTCALL,
      "Recursively apply a function to every element in an aggregate object."},
     {"_fx_map_arg",
-     (PyCFunction)(void*)(py_map_arg),
+     (PyCFunction)(void*)py_map_arg,
      METH_FASTCALL,
      "Recursively apply a function to every Node in an aggregate object."},
     {nullptr, nullptr, 0, nullptr} // Sentinel

@@ -3,16 +3,10 @@
 #include <torch/csrc/jit/runtime/static/ops.h>
 
 #include <ATen/CPUFunctions.h>
-#include <ATen/NativeFunctions.h>
-#include <ATen/ScalarOps.h>
-#include <ATen/TensorUtils.h>
 #include <ATen/native/IndexingUtils.h>
 #include <ATen/native/NonSymbolicBC.h>
-#include <ATen/native/Resize.h>
-#include <ATen/native/TensorAdvancedIndexing.h>
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/irange.h>
-#include <c10/util/ssize.h>
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/mobile/promoted_prim_ops.h>
 #include <torch/csrc/jit/runtime/register_ops_utils.h>
@@ -529,7 +523,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::to, aten_to, [](Node* n) -> SROperator {
       const auto in1_i = p_node->Input(1).toOptional<at::ScalarType>();
       const auto in2_i = p_node->Input(2).toBool();
       const auto in3_i = p_node->Input(3).toBool();
-      // To mimick the behavior of the JIT interpreter, if both dtype
+      // To mimic the behavior of the JIT interpreter, if both dtype
       // and copy are not set, we return self. Otherwise, we assume
       // that dtype is set.
       if (!in1_i && !in3_i) {
@@ -537,7 +531,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(aten::to, aten_to, [](Node* n) -> SROperator {
       } else {
         TORCH_CHECK(
             in1_i,
-            "dytpe cannot be None when copy is True for aten::to.prim_dtype");
+            "dtype cannot be None when copy is True for aten::to.prim_dtype");
         p_node->Output(0) = at::native::to(in0_t, *in1_i, in2_i, in3_i);
       }
     };
@@ -1251,8 +1245,7 @@ REGISTER_NATIVE_OPERATOR_FUNCTOR(
       }
       return [](ProcessedNode* pnode) {
         const auto& elems = pnode->Input(0).toTupleRef().elements();
-        using c10::ssize;
-        const auto num_elems = ssize(elems);
+        const auto num_elems = std::ssize(elems);
         const auto idx = pnode->Input(1).toInt();
         const auto norm_idx = normalizeIndex(idx, num_elems);
         if (norm_idx < 0 || norm_idx >= num_elems) {

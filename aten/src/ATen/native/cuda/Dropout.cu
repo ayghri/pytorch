@@ -41,9 +41,7 @@ template <
     int ADims,
     int VEC,
     typename mask_t>
-#if __CUDA_ARCH__ >= 350 || defined(USE_ROCM)
 C10_LAUNCH_BOUNDS_2(256, 4)
-#endif
 __global__ void
 fused_dropout_kernel_vec(at::cuda::detail::TensorInfo<const scalar_t, IndexType> a,
                          at::cuda::detail::TensorInfo<scalar_t, IndexType> b,
@@ -60,7 +58,7 @@ fused_dropout_kernel_vec(at::cuda::detail::TensorInfo<const scalar_t, IndexType>
 
   // Helps align the total number of times curand_uniform4 is called by each thread for the same totalElements
   // in the vec=2 and vec=4 cases.
-  bool gridxvec_loop_state = 0;
+  bool gridxvec_loop_state = false;
   accscalar_t scale = 1.0 / p;
 
   constexpr int RAND_SIZE = (VEC + 4 - 1) / 4;
@@ -75,7 +73,7 @@ fused_dropout_kernel_vec(at::cuda::detail::TensorInfo<const scalar_t, IndexType>
     // We'll use this to actually cause vectorized loads later
     LoadT *value = reinterpret_cast<LoadT*>(&src);
 
-    //curand_uniform_double was pure evil anyway, not doing what it promises, and there's nothing for halfs, so generate float for everything
+    //curand_uniform_double was pure evil anyway, not doing what it promises, and there's nothing for Halfs, so generate float for everything
     // Note: need a new set of random values per 4 elements -- we'll handle VEC elements in this thread, so need ceil(VEC / 4)
     // sets of rand.
     if ((VEC >= 4) || (gridxvec_loop_state == 0)) {
@@ -139,9 +137,7 @@ template <
     int ADims,
     int BDims = ADims,
     typename mask_t>
-#if __CUDA_ARCH__ >= 350 || defined(USE_ROCM)
 C10_LAUNCH_BOUNDS_2(256, 4)
-#endif
 __global__ void
 fused_dropout_kernel(cuda::detail::TensorInfo<const scalar_t, IndexType> a,
                      cuda::detail::TensorInfo<scalar_t, IndexType> b,
@@ -159,7 +155,7 @@ fused_dropout_kernel(cuda::detail::TensorInfo<const scalar_t, IndexType> a,
   for (IndexType linearIndex = idx;
        linearIndex < rounded_size;
        linearIndex += gridDim.x * blockDim.x*UNROLL) {
-//curand_uniform_double was pure evil anyway, not doing what it promises, and there's nothing for halfs, so generate float for everything
+//curand_uniform_double was pure evil anyway, not doing what it promises, and there's nothing for Halfs, so generate float for everything
        float4 rand = curand_uniform4(&state);
        scalar_t src[UNROLL];
        rand.x = rand.x < p;

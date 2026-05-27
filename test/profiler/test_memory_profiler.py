@@ -2,11 +2,9 @@
 import functools
 import gc
 import itertools as it
-import sys
 import textwrap
 import unittest
-from collections.abc import Iterator
-from typing import Callable, Optional
+from collections.abc import Callable, Iterator
 
 import torch
 from torch._C._profiler import _EventType, _TensorMetadata
@@ -15,6 +13,8 @@ from torch.testing._internal.common_device_type import instantiate_device_type_t
 from torch.testing._internal.common_utils import (
     ALLOW_XPU_PROFILING_TEST,
     DEVICE_LIST_SUPPORT_PROFILING_TEST,
+    IS_MACOS,
+    IS_WINDOWS,
     run_tests,
     skipIfTorchDynamo,
     TestCase,
@@ -104,7 +104,6 @@ class RecordInputOutputDispatchMode(torch.utils._python_dispatch.TorchDispatchMo
         return out
 
 
-@unittest.skipIf(sys.version_info >= (3, 13), "many segfaults")
 @skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
 class TestIdentifyGradients(TestCase):
     def gradient_detected(
@@ -112,7 +111,7 @@ class TestIdentifyGradients(TestCase):
         prof: torch.profiler.profile,
         ctx: _EventType,
         grad_tensor: torch.Tensor,
-        parameter: Optional[torch.Tensor] = None,
+        parameter: torch.Tensor | None = None,
     ) -> None:
         # This is not an exhaustive check, but for the purpose of unit testing
         # it is sufficient.
@@ -283,6 +282,9 @@ class TestIdentifyGradients(TestCase):
     def test_extract_gradients_from_optimizer(self) -> None:
         self._test_extract_gradients_from_optimizer(set_to_none=False)
 
+    @unittest.skipIf(
+        IS_MACOS or IS_WINDOWS, "https://github.com/pytorch/pytorch/issues/88721"
+    )
     def test_extract_gradients_from_optimizer_set_to_none(self) -> None:
         self._test_extract_gradients_from_optimizer(set_to_none=True)
 
@@ -329,7 +331,7 @@ class TestDataFlow(TestCase):
     @staticmethod
     def _run_and_format_data_flow(
         inputs: dict[str, torch.Tensor],
-        f: Callable[..., Optional[dict[str, torch.Tensor]]],
+        f: Callable[..., dict[str, torch.Tensor] | None],
         indent: int = 12,
     ) -> str:
         with profile() as prof:
@@ -497,7 +499,7 @@ class TestDataFlow(TestCase):
             z = x.mul(y)
             return {"z": z.view_as(z)}
 
-        def f1(x, y):  # noqa: F841
+        def f1(x, y):
             with torch.no_grad():
                 return f0(x, y)
 
@@ -828,13 +830,12 @@ class TestDataFlow(TestCase):
         )
 
 
-@unittest.skipIf(sys.version_info >= (3, 13), "many segfaults")
 @skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
 class TestMemoryProfilerE2E(TestCase):
     @staticmethod
     def _lookup_tensor_categories(
         t: torch.Tensor, memory_profile: _memory_profiler.MemoryProfile
-    ) -> dict[_memory_profiler.TensorAndID, Optional[_memory_profiler.Category]]:
+    ) -> dict[_memory_profiler.TensorAndID, _memory_profiler.Category | None]:
         storage = t.storage()
         if storage is None:
             raise ValueError("Cannot look up uninitialized Tensor.")
@@ -868,7 +869,8 @@ class TestMemoryProfilerE2E(TestCase):
             should_be_none: bool = False,
         ):
             if should_be_none:
-                assert t is None, "tensor should be None but is not."
+                if t is not None:
+                    raise AssertionError("tensor should be None but is not.")
                 return
             self.assertIsNotNone(t)
             categories = self._lookup_tensor_categories(t, memory_profile)
@@ -904,7 +906,7 @@ class TestMemoryProfilerE2E(TestCase):
                         ptr_pair_to_key[(t.impl_ptr, t.storage_data_ptr)] = key
 
         def format_categories(ptr_pair: int):
-            target_key = ptr_pair_to_key.get(ptr_pair, None)
+            target_key = ptr_pair_to_key.get(ptr_pair)
             if target_key is None:
                 return "???"
 
@@ -913,7 +915,8 @@ class TestMemoryProfilerE2E(TestCase):
                 for (key, version), category in snapshot.items()
                 if key == target_key
             )
-            assert matches, "Failed to lookup Tensor"
+            if not matches:
+                raise AssertionError("Failed to lookup Tensor")
 
             # Deduplicate version bumps which don't change the category.
             categories = [matches[0][1]]
@@ -1125,7 +1128,7 @@ class TestMemoryProfilerE2E(TestCase):
         w1 = torch.ones((1,), requires_grad=True)
 
         def step_fn(_):
-            x = torch.ones((2, 2))  # noqa: F841
+            x = torch.ones((2, 2))
             y = torch.cat([x * w0, x * w1], dim=1)  # noqa: F841
 
         # NOTE: We expect that all unknown categories. This is simply a sanity
@@ -1177,12 +1180,10 @@ class TestMemoryProfilerE2E(TestCase):
             aten::mul.Tensor                         17 (AUTOGRAD_DETAIL), 1 (INPUT)               -> 20 (AUTOGRAD_DETAIL)
             aten::sum.dim_IntList                    20 (AUTOGRAD_DETAIL)                          -> 21 (GRADIENT)
             aten::view                               21 (GRADIENT)                                 -> 21 (GRADIENT)
-            aten::detach                             21 (GRADIENT)                                 -> 21 (GRADIENT)
             aten::detach                             21 (GRADIENT)                                 -> ???
             aten::mul.Tensor                         17 (AUTOGRAD_DETAIL), 1 (INPUT)               -> 22 (AUTOGRAD_DETAIL)
             aten::sum.dim_IntList                    22 (AUTOGRAD_DETAIL)                          -> 23 (GRADIENT)
             aten::view                               23 (GRADIENT)                                 -> 23 (GRADIENT)
-            aten::detach                             23 (GRADIENT)                                 -> 23 (GRADIENT)
             aten::detach                             23 (GRADIENT)                                 -> ???""",
         )
 
@@ -1230,11 +1231,9 @@ class TestMemoryProfilerE2E(TestCase):
             aten::sum.dim_IntList                    20 (AUTOGRAD_DETAIL)                          -> 21 (GRADIENT)
             aten::view                               21 (GRADIENT)                                 -> 21 (GRADIENT)
             aten::detach                             21 (GRADIENT)                                 -> 21 (GRADIENT)
-            aten::detach                             21 (GRADIENT)                                 -> 21 (GRADIENT)
             aten::mul.Tensor                         17 (AUTOGRAD_DETAIL), 1 (INPUT)               -> 22 (AUTOGRAD_DETAIL)
             aten::sum.dim_IntList                    22 (AUTOGRAD_DETAIL)                          -> 23 (GRADIENT)
             aten::view                               23 (GRADIENT)                                 -> 23 (GRADIENT)
-            aten::detach                             23 (GRADIENT)                                 -> 23 (GRADIENT)
             aten::detach                             23 (GRADIENT)                                 -> 23 (GRADIENT)
 
             -- Optimizer --------------------------------------------------------------------------------------------
@@ -1280,10 +1279,8 @@ class TestMemoryProfilerE2E(TestCase):
             aten::t                                  7 (GRADIENT)                                  -> 7 (GRADIENT)
             aten::sum.dim_IntList                    6 (ACTIVATION)                                -> 9 (GRADIENT)
             aten::view                               9 (GRADIENT)                                  -> 9 (GRADIENT)
-            aten::detach                             9 (GRADIENT)                                  -> 9 (GRADIENT)
             aten::detach                             9 (GRADIENT)                                  -> ???
             aten::t                                  7 (GRADIENT)                                  -> 7 (GRADIENT)
-            aten::detach                             7 (GRADIENT)                                  -> 7 (GRADIENT)
             aten::detach                             7 (GRADIENT)                                  -> ???""",
         )
 
@@ -1321,19 +1318,15 @@ class TestMemoryProfilerE2E(TestCase):
             aten::sum.dim_IntList                    6 (ACTIVATION)                                -> 9 (GRADIENT)
             aten::view                               9 (GRADIENT)                                  -> 9 (GRADIENT)
             aten::detach                             9 (GRADIENT)                                  -> 9 (GRADIENT)
-            aten::detach                             9 (GRADIENT)                                  -> 9 (GRADIENT)
             aten::t                                  7 (GRADIENT)                                  -> 7 (GRADIENT)
-            aten::detach                             7 (GRADIENT)                                  -> 7 (GRADIENT)
             aten::detach                             7 (GRADIENT)                                  -> 7 (GRADIENT)
 
             -- Optimizer --------------------------------------------------------------------------------------------
+            aten::detach                             7 (GRADIENT)                                  -> 7 (GRADIENT)
             aten::clone                              7 (GRADIENT)                                  -> 10 (OPTIMIZER_STATE)
-            aten::detach                             10 (OPTIMIZER_STATE)                          -> 10 (OPTIMIZER_STATE)
-            aten::detach                             10 (OPTIMIZER_STATE)                          -> 10 (OPTIMIZER_STATE)
             aten::add_.Tensor                        2 (PARAMETER), 10 (OPTIMIZER_STATE)           -> 2 (PARAMETER)
+            aten::detach                             9 (GRADIENT)                                  -> 9 (GRADIENT)
             aten::clone                              9 (GRADIENT)                                  -> 11 (OPTIMIZER_STATE)
-            aten::detach                             11 (OPTIMIZER_STATE)                          -> 11 (OPTIMIZER_STATE)
-            aten::detach                             11 (OPTIMIZER_STATE)                          -> 11 (OPTIMIZER_STATE)
             aten::add_.Tensor                        3 (PARAMETER), 11 (OPTIMIZER_STATE)           -> 3 (PARAMETER)""",
         )
 
@@ -1417,7 +1410,6 @@ class TestMemoryProfilerE2E(TestCase):
             aten::t                                  7 (PARAMETER)                                 -> 7 (PARAMETER)
             aten::mm                                 25 (AUTOGRAD_DETAIL), 7 (PARAMETER)           -> 27 (AUTOGRAD_DETAIL)
             aten::t                                  26 (GRADIENT)                                 -> 26 (GRADIENT)
-            aten::detach                             26 (GRADIENT)                                 -> 26 (GRADIENT)
             aten::detach                             26 (GRADIENT)                                 -> ???
             aten::detach                             6 (ACTIVATION)                                -> 6 (ACTIVATION)
             aten::threshold_backward                 27 (AUTOGRAD_DETAIL), 6 (ACTIVATION)          -> 28 (AUTOGRAD_DETAIL)
@@ -1426,10 +1418,8 @@ class TestMemoryProfilerE2E(TestCase):
             aten::t                                  29 (GRADIENT)                                 -> 29 (GRADIENT)
             aten::sum.dim_IntList                    28 (AUTOGRAD_DETAIL)                          -> 30 (GRADIENT)
             aten::view                               30 (GRADIENT)                                 -> 30 (GRADIENT)
-            aten::detach                             30 (GRADIENT)                                 -> 30 (GRADIENT)
             aten::detach                             30 (GRADIENT)                                 -> ???
             aten::t                                  29 (GRADIENT)                                 -> 29 (GRADIENT)
-            aten::detach                             29 (GRADIENT)                                 -> 29 (GRADIENT)
             aten::detach                             29 (GRADIENT)                                 -> ???""",
         )
 
@@ -1454,7 +1444,7 @@ class TestMemoryProfilerE2E(TestCase):
         memory_profile = prof._memory_profile()
         timeline = memory_profile.timeline
         times = tuple(t for t, _, _, _ in timeline)
-        self.assertTrue(all(t1 >= t0 for t0, t1 in zip(times, times[1:])), times)
+        self.assertTrue(all(t1 >= t0 for t0, t1 in it.pairwise(times)), times)
         self.assertTrue(
             all(
                 (t == -1) if action == _memory_profiler.Action.PREEXISTING else (t > 0)
@@ -1495,7 +1485,7 @@ class TestMemoryProfilerE2E(TestCase):
             for _, action, (key, version), size in prof._memory_profile().timeline
             # We generally don't care about tiny allocations during memory
             # profiling and they add a lot of noise to the unit test.
-            if size > 1024
+            if size > 1024 and isinstance(key, _memory_profiler.TensorKey)
         ]
 
         self.assertExpectedInline(

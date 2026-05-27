@@ -4,10 +4,11 @@
 import dataclasses
 import io
 import logging
-import operator
+import math
+import sys
+from bisect import bisect_right, insort
 from collections import ChainMap
-from functools import reduce
-from typing import Any, cast, Optional, Union
+from typing import Any, cast
 
 import torch
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -39,6 +40,7 @@ from torch.distributed.checkpoint.planner import (
 )
 from torch.distributed.checkpoint.planner_helpers import (
     _compare_save_plans,
+    _contains_usable_plan,
     _create_default_metadata_only_plan,
     _create_read_items,
     _create_write_items,
@@ -72,7 +74,7 @@ class DefaultSavePlanner(SavePlanner):
         self,
         flatten_state_dict: bool = True,
         flatten_sharded_tensors: bool = True,
-        dedup_replicated_tensors: Optional[bool] = None,
+        dedup_replicated_tensors: bool | None = None,
         dedup_save_to_lowest_rank: bool = False,
         enable_plan_caching: bool = False,
     ) -> None:
@@ -92,7 +94,7 @@ class DefaultSavePlanner(SavePlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        storage_meta: Optional[StorageMeta] = None,
+        storage_meta: StorageMeta | None = None,
         is_coordinator: bool = False,
     ) -> None:
         if self.flatten_state_dict:
@@ -121,16 +123,24 @@ class DefaultSavePlanner(SavePlanner):
                 )
                 return SavePlan([], usable=False)
             else:
-                SavePlanner._cached_save_plan[self._cached_plans_key] = plan
+                # Store the plan as pending. It will be promoted to the
+                # class-level cache in finish_plan after the global plan
+                # has succeeded. This avoids a stale local cache when
+                # the global plan fails (e.g. validation error) but the
+                # local cache was already populated.
+                self._pending_local_plan = plan
 
         return self.plan
+
+    def _dedup_save_plans(self, all_plans: list[SavePlan]) -> list[SavePlan]:
+        return dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
 
     def _create_global_plan(
         self, all_plans: list[SavePlan]
     ) -> tuple[list[SavePlan], Metadata]:
-        all_plans = dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
+        deduped_plans = self._dedup_save_plans(all_plans)
 
-        global_plan, metadata = create_default_global_save_plan(all_plans)
+        global_plan, metadata = create_default_global_save_plan(deduped_plans)
 
         if self.flatten_state_dict:
             # | does not work for Python 3.8 or older version.
@@ -141,8 +151,12 @@ class DefaultSavePlanner(SavePlanner):
             merged_mappings = dict(ChainMap(*planner_data_dict))
             metadata = dataclasses.replace(metadata, planner_data=merged_mappings)
 
-        if not _validate_global_plan(global_plan, metadata):
-            raise ValueError("Failed to validate global plan")
+        validation_errors = _validate_global_plan(global_plan, metadata)
+        if validation_errors:
+            error_summary = "; ".join(validation_errors)
+            if len(error_summary) > 500:
+                error_summary = error_summary[:500] + "... (truncated)"
+            raise ValueError(f"Failed to validate global plan: {error_summary}")
 
         return global_plan, metadata
 
@@ -156,32 +170,54 @@ class DefaultSavePlanner(SavePlanner):
         global_plan_delta: list[SavePlan] = []
 
         if self._cached_plans_key not in SavePlanner._cached_all_plans:
-            SavePlanner._cached_all_plans[self._cached_plans_key] = all_plans
+            # Case 1: If the plans are not cached, the cache will be hydrated with the
+            # all_plans, global_plans (Deduped), and metadata.
+
+            # First create and validate the global plan. Only cache everything
+            # after success to avoid partial cache state
             global_plan, metadata = self._create_global_plan(all_plans)
+
+            # Cache all plans atomically after successful validation
+            SavePlanner._cached_all_plans[self._cached_plans_key] = all_plans
             SavePlanner._cached_global_plan[self._cached_plans_key] = global_plan
+            SavePlanner._cached_metadata[self._cached_plans_key] = metadata
             # If plans are not cached, global_plan delta will be the same as global plan.
             return global_plan, global_plan, metadata
 
-        # We get global plan for the new delta plans.
-        # Ranks have already cached the plans which have not changed.
-        merged_plans = _merge_delta_local_plans(
-            SavePlanner._cached_all_plans[self._cached_plans_key], all_plans
-        )
-        global_plan, metadata = self._create_global_plan(merged_plans)
+        # Case 2: Plans are cached
+        if not _contains_usable_plan(all_plans):
+            # Case 2.1: Plans are cached and the local plans have NOT changed (No usable plans).
+            # Global plan delta will be empty plans to avoid the collective overhead.
+            # We can reuse the deduped global plan and metadata from the cache directly.
+            global_plan_delta = [SavePlan([], usable=False)] * len(all_plans)
+            global_plan = SavePlanner._cached_global_plan[self._cached_plans_key]
+            metadata = SavePlanner._cached_metadata[self._cached_plans_key]
+        else:
+            # Case 2.2: Plans are cached but the local plans have changed.
+            # We will merge the changed local plans with the cached local plans.
+            # Updated plans will overwrite the cached plans. New global plan and metadata will be created and cached.
+            # Global plan delta will be created by comparing the new global plan with the cached global plan.
+            # Only the global plan delta (updated ones) will be sent to the coordinator to avoid the collective overhead.
+            merged_plans = _merge_delta_local_plans(
+                SavePlanner._cached_all_plans[self._cached_plans_key], all_plans
+            )
+            # Cache the updated local plans
+            SavePlanner._cached_all_plans[self._cached_plans_key] = merged_plans
+            global_plan, metadata = self._create_global_plan(merged_plans)
 
-        if self._cached_plans_key in self._cached_global_plan:
-            for cached_plan, new_plan in zip(
-                SavePlanner._cached_global_plan[self._cached_plans_key], global_plan
-            ):
-                if _compare_save_plans(cached_plan, new_plan):
-                    global_plan_delta.append(SavePlan([], usable=False))
-                else:
-                    global_plan_delta.append(new_plan)
+            if self._cached_plans_key in self._cached_global_plan:
+                for cached_plan, new_plan in zip(
+                    SavePlanner._cached_global_plan[self._cached_plans_key], global_plan
+                ):
+                    if _compare_save_plans(cached_plan, new_plan):
+                        global_plan_delta.append(SavePlan([], usable=False))
+                    else:
+                        global_plan_delta.append(new_plan)
 
-        SavePlanner._cached_global_plan[self._cached_plans_key] = global_plan
+            # Cache the new global plan and the metadata
+            SavePlanner._cached_global_plan[self._cached_plans_key] = global_plan
+            SavePlanner._cached_metadata[self._cached_plans_key] = metadata
 
-        # If the plans are cached, global_plan delta will be the delta
-        # of new global plan and cached global plan.
         return global_plan_delta, global_plan, metadata
 
     def create_global_plan(
@@ -222,10 +258,20 @@ class DefaultSavePlanner(SavePlanner):
         if self._enable_plan_caching:
             finished_plan = self._finish_plan_with_caching(new_plan)
 
+            # Promote the pending local plan to the class-level cache now
+            # that the global plan has succeeded and we are finalizing.
+            # This ensures the local cache is only populated after a
+            # successful end-to-end checkpoint plan creation.
+            if hasattr(self, "_pending_local_plan"):
+                SavePlanner._cached_save_plan[self._cached_plans_key] = (
+                    self._pending_local_plan
+                )
+                del self._pending_local_plan
+
         self.plan = finished_plan
         return self.plan
 
-    def resolve_data(self, write_item: WriteItem) -> Union[torch.Tensor, io.BytesIO]:
+    def resolve_data(self, write_item: WriteItem) -> torch.Tensor | io.BytesIO:
         object = self.lookup_object(write_item.index)
         return self.transform_object(write_item, object)
 
@@ -271,7 +317,7 @@ class DefaultLoadPlanner(LoadPlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        metadata: Optional[Metadata] = None,
+        metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
         _init_state_dict(state_dict)
@@ -288,7 +334,8 @@ class DefaultLoadPlanner(LoadPlanner):
         self.is_coordinator = is_coordinator
 
     def create_local_plan(self) -> LoadPlan:
-        assert self.metadata is not None
+        if self.metadata is None:
+            raise AssertionError("self.metadata is not None")
         if self.flatten_state_dict:
             # To support checkpoints that are saved before v2.4, we have to
             # differentiate if the missing keys are due to old checkpoints.
@@ -383,7 +430,7 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
             return True
 
         if key in self.keys:
-            True
+            return True
 
         unflattened_keys: list[str] = []
         planner_data = metadata.planner_data.get(key)
@@ -404,11 +451,13 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        metadata: Optional[Metadata] = None,
+        metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
-        assert not state_dict
-        assert metadata is not None
+        if state_dict:
+            raise AssertionError("not state_dict")
+        if metadata is None:
+            raise AssertionError("metadata is not None")
 
         # rebuild the state dict from the metadata
         for k, v in metadata.state_dict_metadata.items():
@@ -417,7 +466,7 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
 
             if isinstance(v, TensorStorageMetadata):
                 v = torch.empty(v.size, dtype=v.properties.dtype)  # type: ignore[assignment]
-            if k in metadata.planner_data:
+            if metadata.planner_data is not None and k in metadata.planner_data:
                 set_element(state_dict, metadata.planner_data[k], v)
             else:
                 state_dict[k] = v
@@ -523,14 +572,16 @@ def create_default_global_save_plan(
     for plan in all_plans:
         new_items = []
         for item in plan.items:
-            if not item.type == WriteItemType.SHARD:
-                assert item.index.fqn not in md
+            if item.type != WriteItemType.SHARD:
+                if item.index.fqn in md:
+                    raise AssertionError("item.index.fqn not in md")
 
             if item.type == WriteItemType.BYTE_IO:
                 md[item.index.fqn] = BytesStorageMetadata()
                 new_items.append(item)
             else:
-                assert item.tensor_data is not None
+                if item.tensor_data is None:
+                    raise AssertionError("item.tensor_data is not None")
                 tensor_md = cast(
                     TensorStorageMetadata,
                     md.setdefault(
@@ -550,10 +601,11 @@ def create_default_global_save_plan(
                     new_item = dataclasses.replace(item, index=new_index)
                 new_items.append(new_item)
 
-                assert item.tensor_data.chunk is not None, f"""
+                if item.tensor_data.chunk is None:
+                    raise AssertionError(f"""
                     Cannot create MD for tensor without bounds.
                     FQN: {item.index.fqn}
-                """
+                """)
                 tensor_md.chunks.append(item.tensor_data.chunk)
         new_plans.append(dataclasses.replace(plan, items=new_items))
     return (new_plans, Metadata(md))
@@ -596,49 +648,64 @@ def _check_box_bounds(
     return True
 
 
-def _validate_global_plan(global_plan: list[SavePlan], metadata: Metadata) -> bool:
-    all_good = True
+def _validate_global_plan(global_plan: list[SavePlan], metadata: Metadata) -> list[str]:
+    """Validate the global plan and return a list of error messages (empty if valid)."""
+    errors: list[str] = []
     for key, value in metadata.state_dict_metadata.items():
         if isinstance(value, BytesStorageMetadata):
             continue
         if len(value.size) == 0:
             continue
+        chunks = value.chunks
         chunks_volume = 0
-        for chunk_idx, chunk0 in enumerate(value.chunks):
+        for chunk in chunks:
             # Compute the volume
-            if not _check_box_bounds(value.size, chunk0):
-                logger.warning(
-                    """
-                        key:%s has out of bounds chunk:
-                        tensor-size:%s chunk: %s
-                    """,
-                    key,
-                    value.size,
-                    chunk0,
+            if not _check_box_bounds(value.size, chunk):
+                msg = (
+                    f"key:{key} has out of bounds chunk: "
+                    f"tensor-size:{value.size} chunk: {chunk}"
                 )
-                all_good = False
-            chunks_volume += reduce(operator.mul, chunk0.sizes, 1)
+                logger.warning(msg)
+                errors.append(msg)
+            chunks_volume += math.prod(chunk.sizes)
 
-            # Check for overlap
-            for chunk1 in value.chunks[chunk_idx + 1 :]:
-                if _check_box_overlap(chunk0, chunk1):
-                    logger.warning(
-                        "key:%s has overlapping chunks: %s %s", key, chunk0, chunk1
-                    )
-                    all_good = False
+        if len(chunks) > 1:
+            dims = len(value.size)
+            sweep_dim = max(range(dims), default=0, key=lambda d: value.size[d])
+            sorted_indices = sorted(
+                range(len(chunks)),
+                key=lambda idx: (
+                    chunks[idx].offsets[sweep_dim],
+                    *(chunks[idx].offsets[d] for d in range(dims)),
+                ),
+            )
+            active: list[tuple[int, int]] = []
+            for idx in sorted_indices:
+                current = chunks[idx]
+                start = current.offsets[sweep_dim]
+                end = start + current.sizes[sweep_dim]
+
+                cutoff = bisect_right(active, (start, sys.maxsize))
+                if cutoff:
+                    del active[:cutoff]
+
+                for _, other_idx in active:
+                    other = chunks[other_idx]
+                    if _check_box_overlap(current, other):
+                        msg = f"key:{key} has overlapping chunks: {current} {other}"
+                        logger.warning(msg)
+                        errors.append(msg)
+
+                insort(active, (end, idx))
 
         # Check whether combined chunk cover the whole tensor
-        tensor_volume = reduce(operator.mul, value.size, 1)
-        if chunks_volume != tensor_volume:
-            logger.warning(
-                """
-                    key:%s invalid fill tensor-volume:
-                    %s chunks-volume: %s
-                """,
-                key,
-                tensor_volume,
-                chunks_volume,
+        tensor_volume = math.prod(value.size)
+        if len(global_plan) > 1 and chunks_volume != tensor_volume:
+            msg = (
+                f"key:{key} invalid fill tensor-volume: "
+                f"{tensor_volume} chunks-volume: {chunks_volume}"
             )
-            all_good = False
+            logger.warning(msg)
+            errors.append(msg)
 
-    return all_good
+    return errors

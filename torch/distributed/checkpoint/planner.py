@@ -4,7 +4,7 @@ import operator
 from dataclasses import dataclass
 from enum import auto, Enum
 from functools import reduce
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch.distributed.checkpoint.metadata import (
@@ -20,6 +20,7 @@ from torch.distributed.checkpoint.metadata import (
 __all__ = [
     "WriteItemType",
     "LoadItemType",
+    "BytesIOWriteData",
     "TensorWriteData",
     "WriteItem",
     "ReadItem",
@@ -42,6 +43,11 @@ class LoadItemType(Enum):
 
 
 @dataclass(frozen=True)
+class BytesIOWriteData:
+    nbytes: int
+
+
+@dataclass(frozen=True)
 class TensorWriteData:
     chunk: ChunkStorageMetadata
     properties: TensorProperties
@@ -55,10 +61,13 @@ class WriteItem:
     index: MetadataIndex
     type: WriteItemType
 
-    # Value present if it's a tensor write
-    tensor_data: Optional[TensorWriteData] = None
+    # Size of bytesIO data to be written.
+    bytes_io_data: BytesIOWriteData | None = None
 
-    def tensor_storage_size(self) -> Optional[int]:
+    # Value present if it's a tensor write
+    tensor_data: TensorWriteData | None = None
+
+    def tensor_storage_size(self) -> int | None:
         """
         Calculates the storage size of the underlying tensor, or None if this is not a tensor write.
 
@@ -141,7 +150,7 @@ class SavePlanner(abc.ABC):
     There are 3 usual patterns of extension:
 
     Rewriting state_dict. This is the simplest way to extend the save process as it
-    doesn't requite understanding the intrincacies of how SavePlan works:
+    doesn't require understanding the intricacies of how SavePlan works:
 
     >>> # xdoctest: +SKIP("undefined vars")
     >>> class RenamePlanner(DefaultSavePlanner):
@@ -223,18 +232,21 @@ class SavePlanner(abc.ABC):
     # Global checkpoint plan as computed by `create_global_plan` API.
     # Cached on the coordinator rank.
     _cached_global_plan: dict[str, list[SavePlan]] = {}
+    # Metadata for the global checkpoint plan as computed by `create_global_plan` API.
+    # Cached on the coordinator rank.
+    _cached_metadata: dict[str, Metadata] = {}
 
     @abc.abstractmethod
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        storage_meta: Optional[StorageMeta] = None,
+        storage_meta: StorageMeta | None = None,
         is_coordinator: bool = False,
     ) -> None:
         """
         Initialize this planner to save ``state_dict``.
 
-        Implementations should save those values as they won't be provided lated in the save process.
+        Implementations should save those values as they won't be provided later in the save process.
 
         This is called on all ranks.
         """
@@ -269,7 +281,7 @@ class SavePlanner(abc.ABC):
         """
 
     @abc.abstractmethod
-    def resolve_data(self, write_item: WriteItem) -> Union[torch.Tensor, io.BytesIO]:
+    def resolve_data(self, write_item: WriteItem) -> torch.Tensor | io.BytesIO:
         """
         Transform and prepare ``write_item`` from ``state_dict`` for storage, ensuring idempotency and thread-safety.
 
@@ -321,7 +333,7 @@ class LoadPlanner:
     There are two usual patterns of extension:
 
     Rewriting state_dict. This is the simplest way to extend the load process as it
-    doesn't requite understanding the intrincacies of how LoadPlan works. We need
+    doesn't require understanding the intricacies of how LoadPlan works. We need
     to keep a reference to the original state_dict as load happens in place so
     we need to be able to perform it in place
 
@@ -367,7 +379,7 @@ class LoadPlanner:
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        metadata: Optional[Metadata] = None,
+        metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
         """

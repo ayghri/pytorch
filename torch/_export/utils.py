@@ -8,20 +8,24 @@ import json
 import math
 import operator
 import re
-from collections.abc import Iterable
+from collections import defaultdict
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from inspect import ismethod, Parameter
-from typing import Any, Callable, Optional, TYPE_CHECKING, Union
+from typing import Any, TYPE_CHECKING
 
 import torch
 from torch._guards import detect_fake_mode
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch._subclasses.functional_tensor import FunctionalTensor
 from torch.fx._utils import first_call_function_nn_module_stack
+from torch.fx.experimental.proxy_tensor import PreDispatchTorchFunctionMode
 from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 
 
 if TYPE_CHECKING:
+    import sympy
+
     from torch._export.passes.lift_constants_pass import ConstantAttrMap
     from torch._ops import OperatorBase
     from torch.export import ExportedProgram
@@ -36,7 +40,7 @@ from torch.utils._pytree import (
     _deregister_pytree_node,
     _register_pytree_node,
     Context,
-    FlattenFunc,
+    FlattenFn,
     FromDumpableContextFn,
     GetAttrKey,
     KeyPath,
@@ -45,7 +49,7 @@ from torch.utils._pytree import (
     SequenceKey,
     ToDumpableContextFn,
     tree_flatten_with_path,
-    UnflattenFunc,
+    UnflattenFn,
 )
 
 
@@ -57,6 +61,8 @@ placeholder_prefixes = {
     InputKind.CUSTOM_OBJ: "obj_",
     InputKind.TOKEN: "token",
 }
+
+_DISABLE_ATEN_TO_ASSERTION_PASS = False
 
 
 def _collect_and_set_constant_attrs(
@@ -165,7 +171,8 @@ def _collect_param_buffer_metadata(mod: torch.fx.GraphModule) -> dict[str, Any]:
         t = model
         for item in prefix:
             t = getattr(t, item, None)  # type: ignore[assignment]
-            assert t is not None
+            if t is None:
+                raise AssertionError(f"attribute {item!r} not found in path")
 
         return getattr(t, field)
 
@@ -206,6 +213,33 @@ def _collect_param_buffer_metadata(mod: torch.fx.GraphModule) -> dict[str, Any]:
                             params_buffers_to_node_meta[arg.target][entry] = meta[entry]
 
     return params_buffers_to_node_meta
+
+
+def _maybe_find_pre_dispatch_tf_mode_for_export():
+    if not torch.compiler.is_exporting():
+        return None
+
+    if not torch._C._is_torch_function_mode_enabled():
+        return None
+
+    torch_function_mode_stack = torch.overrides._get_current_function_mode_stack()
+
+    pre_dispatch_tf_modes = [
+        mode
+        for mode in torch_function_mode_stack
+        if isinstance(mode, PreDispatchTorchFunctionMode)
+    ]
+
+    if len(pre_dispatch_tf_modes) > 1:
+        raise AssertionError(
+            f"Expected only one PreDispatchTorchFunctionMode, found {len(pre_dispatch_tf_modes)}"
+        )
+
+    if len(pre_dispatch_tf_modes) == 0:
+        return None
+
+    mode = pre_dispatch_tf_modes[0]
+    return mode
 
 
 def _populate_param_buffer_metadata_to_new_gm(
@@ -253,6 +287,8 @@ def _get_shape_env_from_gm(gm: torch.fx.GraphModule):
 
 def _rename_without_collisions(
     name_map: dict[str, str],
+    find_available: dict[str, int],
+    used_names: set[str],
     orig_name: str,
     name: str,
     is_placeholder: bool = False,
@@ -260,45 +296,78 @@ def _rename_without_collisions(
     """
     Renames nodes to avoid name collisions, with suffixing.
     name_map: map from original name to new name
+    find_available: map prefix to available suffix
+    used_names: cache of used names
     orig_name: mapping key
     name: candidate name (potentially suffixed, e.g. mul_2)
     is_placeholder: if the node is a placeholder, avoid detecting suffix
     """
-    if name in name_map.values():
-        # non-placeholder nodes may be suffixed with the count
-        # instead of adding another suffix, we will try to increment it
-        match = re.match(r"(.*)_(\d+)", name)
-        if match and not is_placeholder:
-            name, n = match.group(1), int(match.group(2))
-        else:
-            n = 0
-        while (dup_name := f"{name}_{n + 1}") in name_map.values():
-            n += 1
-        name_map[orig_name] = dup_name
-    else:
-        name_map[orig_name] = name
+    match = re.match(r"(.*)_(\d+)", name)
+    key = name
+
+    if match and not is_placeholder:
+        prefix, n = match.group(1), match.group(2)
+        key = prefix
+
+    new_name = name
+    if new_name in used_names:
+        new_name = f"{key}_{find_available[key] + 1}"
+
+    match = re.match(r"(.*)_(\d+)", new_name)
+    if match:
+        prefix, n = match.group(1), match.group(2)
+        if int(n) > find_available[prefix]:
+            find_available[prefix] = int(n)
+
+    name_map[orig_name] = new_name
+    used_names.add(new_name)
+
     return name_map[orig_name]
 
 
-def _check_input_constraints_for_graph(
-    input_placeholders: list[torch.fx.Node], flat_args_with_path, range_constraints
+def get_keystr(key_path: KeyPath) -> str:
+    """For a given index into the flat_args, return a human readable string
+    describing how to access it, e.g. "*args["foo"][0].bar"
+    """
+    # Prefix the keypath with "*args" or "**kwargs" to make it clearer where
+    # the arguments come from. Ultimately we ought to serialize the
+    # original arg names for the best error message here.
+    args_kwargs_key_path = key_path[0]
+    if not isinstance(args_kwargs_key_path, SequenceKey):
+        raise AssertionError(
+            f"expected SequenceKey, got {type(args_kwargs_key_path).__name__}"
+        )
+    if args_kwargs_key_path.idx == 0:
+        return f"*args{keystr(key_path[1:])}"
+    else:
+        kwarg_key = key_path[1]
+        if not isinstance(kwarg_key, (GetAttrKey, MappingKey)):
+            raise AssertionError(
+                f"expected GetAttrKey or MappingKey, got {type(kwarg_key).__name__}"
+            )
+        name = str(kwarg_key)[1:-1]  # get rid of the enclosed []
+        return f"{name}{keystr(key_path[2:])}"
+
+
+def _check_symint(
+    symint: int | torch.SymInt,
+    arg: int,
+    range_constraints,
+    unification_map,
+    keypath: KeyPath,
+    i: int | None = None,
 ) -> None:
-    def get_keystr(key_path: KeyPath) -> str:
-        """For a given index into the flat_args, return a human readable string
-        describing how to access it, e.g. "*args["foo"][0].bar"
-        """
-        # Prefix the keypath with "*args" or "**kwargs" to make it clearer where
-        # the arguments come from. Ultimately we ought to serialize the
-        # original arg names for the best error message here.
-        args_kwargs_key_path = key_path[0]
-        assert isinstance(args_kwargs_key_path, SequenceKey)
-        if args_kwargs_key_path.idx == 0:
-            return f"*args{keystr(key_path[1:])}"
-        else:
-            kwarg_key = key_path[1]
-            assert isinstance(kwarg_key, MappingKey)
-            name = str(kwarg_key)[1:-1]  # get rid of the enclosed []
-            return f"{name}{keystr(key_path[2:])}"
+    from torch.export.dynamic_shapes import _IntWrapper
+
+    if (
+        isinstance(arg, torch.SymInt)
+        and not arg.node.expr.is_number
+        or isinstance(arg, _IntWrapper)
+    ):
+        # This can happen when, say, arg is a fake tensor.
+        # We do not run checks on symbolic shapes of fake inputs as
+        # such checks can affect the shape env.
+        return
 
     import sympy
 
@@ -307,6 +376,76 @@ def _check_input_constraints_for_graph(
     )
     from torch.utils._sympy.solve import try_solve
 
+    if isinstance(symint, torch.SymInt) and len(symint.node.expr.free_symbols) == 1:
+        symbol = next(iter(symint.node.expr.free_symbols))
+        if symbol in unification_map:
+            existing_dim = symint.node.expr.subs(unification_map)
+            if arg != existing_dim:
+                path = get_keystr(keypath)
+                if i is not None:
+                    path += f".shape[{i}]"
+                raise RuntimeError(
+                    f"Expected input at {path} to be equal to {existing_dim}, but got {arg}",
+                )
+        else:
+            if isinstance(symint.node.expr, sympy.Symbol):
+                # Short cut for try_solve below. Also useful in cases where
+                # sympy.Eq(symint.node.expr, arg) would evaluate to False
+                # purely because symbol is constrained to be size-like,
+                # e.g., when symint.node.expr = symbol and arg = 0.
+                unification_map[symbol] = int(arg)
+            else:
+                solution = try_solve(sympy.Eq(symint.node.expr, arg), symbol)
+                if solution is None:
+                    path = get_keystr(keypath)
+                    if i is not None:
+                        path += f".shape[{i}]"
+                    raise RuntimeError(
+                        f"Expected input {path} = {arg} to be "
+                        f"of the form {symint.node.expr}, where {symbol} is an integer"
+                    )
+                else:
+                    unification_map[symbol] = int(solution[1])
+
+        if symint.node.expr in range_constraints:
+            min_val, max_val = _convert_range_to_int(
+                range_constraints[symint.node.expr]
+            )
+            # NOTE: we allow dimensions to be 0/1 at runtime
+            if min_val > 2:
+                if arg < min_val:
+                    path = get_keystr(keypath)
+                    if i is not None:
+                        path += f".shape[{i}]"
+                    raise RuntimeError(
+                        f"Expected input at {path} to be >= {min_val}, but got {arg}",
+                    )
+            if max_val < math.inf:
+                if arg > max_val:
+                    path = get_keystr(keypath)
+                    if i is not None:
+                        path += f".shape[{i}]"
+                    raise RuntimeError(
+                        f"Expected input at {path} to be <= {max_val}, but got {arg}",
+                    )
+    elif isinstance(symint, torch.SymInt) and not symint.node.expr.is_number:
+        # this means we deferred a guard from export analysis to runtime, let this pass
+        # we'll add a runtime assert checking equality to this replacement expression
+        pass
+    elif arg != int(symint):
+        path = get_keystr(keypath)
+        if i is not None:
+            path += f".shape[{i}]"
+        raise RuntimeError(
+            f"Expected input at {path} to be equal to {symint}, but got {arg}. "
+            "If you meant for this dimension to be dynamic, please re-export and specify dynamic_shapes "
+            "(e.g. with Dim.DYNAMIC)"
+        )
+
+
+def _check_input_constraints_for_graph(
+    input_placeholders: list[torch.fx.Node], flat_args_with_path, range_constraints
+) -> None:
     if len(flat_args_with_path) != len(input_placeholders):
         raise RuntimeError(
             "Unexpected number of inputs "
@@ -331,95 +470,52 @@ def _check_input_constraints_for_graph(
                 )
 
             for j, (arg_dim, node_dim) in enumerate(zip(arg.shape, node_val.shape)):
-                if (
-                    isinstance(arg_dim, torch.SymInt)
-                    and not arg_dim.node.expr.is_number
-                ):
-                    # This can happen when, say, arg is a fake tensor.
-                    # We do not run checks on symbolic shapes of fake inputs as
-                    # such checks can affect the shape env.
-                    continue
-                if (
-                    isinstance(node_dim, torch.SymInt)
-                    and len(node_dim.node.expr.free_symbols) == 1
-                ):
-                    symbol = next(iter(node_dim.node.expr.free_symbols))
-                    if symbol in unification_map:
-                        existing_dim = node_dim.node.expr.subs(unification_map)
-                        if arg_dim != existing_dim:
-                            raise RuntimeError(
-                                f"Expected input at {get_keystr(key_path)}.shape[{j}] to be equal to "
-                                f"{existing_dim}, but got {arg_dim}",
-                            )
-                    else:
-                        if isinstance(node_dim.node.expr, sympy.Symbol):
-                            # Short cut for try_solve below. Also useful in cases where
-                            # sympy.Eq(node_dim.node.expr, arg_dim) would evaluate to False
-                            # purely because symbol is constrained to be size-like,
-                            # e.g., when node_dim.node.expr = symbol and arg_dim = 0.
-                            unification_map[symbol] = int(arg_dim)
-                        else:
-                            solution = try_solve(
-                                sympy.Eq(node_dim.node.expr, arg_dim), symbol
-                            )
-                            if solution is None:
-                                raise RuntimeError(  # noqa: B904
-                                    f"Expected input {node.name}.shape[{j}] = {arg_dim} to be "
-                                    f"of the form {node_dim.node.expr}, where {symbol} is an integer"
-                                )
-                            else:
-                                unification_map[symbol] = int(solution[1])
+                _check_symint(
+                    node_dim, arg_dim, range_constraints, unification_map, key_path, j
+                )
 
-                    if node_dim.node.expr in range_constraints:
-                        min_val, max_val = _convert_range_to_int(
-                            range_constraints[node_dim.node.expr]
-                        )
-                        # NOTE: we allow dimensions to be 0/1 at runtime
-                        if min_val > 2:
-                            if arg_dim < min_val:
-                                raise RuntimeError(
-                                    f"Expected input at {get_keystr(key_path)}.shape[{j}] to be >= "
-                                    f"{min_val}, but got {arg_dim}",
-                                )
-                        if max_val < math.inf:
-                            if arg_dim > max_val:
-                                raise RuntimeError(
-                                    f"Expected input at {get_keystr(key_path)}.shape[{j}] to be <= "
-                                    f"{max_val}, but got {arg_dim}",
-                                )
-                elif (
-                    isinstance(node_dim, torch.SymInt)
-                    and not node_dim.node.expr.is_number
-                ):
-                    # this means we deferred a guard from export analysis to runtime, let this pass
-                    # we'll add a runtime assert checking equality to this replacement expression
-                    continue
-                elif arg_dim != node_dim:
-                    raise RuntimeError(
-                        f"Expected input at {get_keystr(key_path)}.shape[{j}] to be equal to "
-                        f"{node_dim}, but got {arg_dim}",
-                    )
         elif isinstance(node_val, (int, float, str)):
-            if type(arg) != type(node_val) or arg != node_val:
+            if type(arg) is not type(node_val):
                 raise RuntimeError(
                     f"Expected input at {get_keystr(key_path)} to be equal to {node_val}, but got {arg}",
                 )
+            # NaN != NaN in Python, so use math.isnan for NaN-to-NaN comparison
+            if isinstance(node_val, float) and math.isnan(node_val):
+                if not isinstance(arg, float) or not math.isnan(arg):
+                    raise RuntimeError(
+                        f"Expected input at {get_keystr(key_path)} to be nan, but got {arg}",
+                    )
+            elif arg != node_val:
+                raise RuntimeError(
+                    f"Expected input at {get_keystr(key_path)} to be equal to {node_val}, but got {arg}",
+                )
+        elif isinstance(node_val, torch.SymInt):
+            _check_symint(
+                node_val,
+                arg,
+                range_constraints,
+                unification_map,
+                key_path,
+                None,
+            )
 
 
 def register_dataclass_as_pytree_node(
     cls: type[Any],
-    flatten_fn: Optional[FlattenFunc] = None,
-    unflatten_fn: Optional[UnflattenFunc] = None,
+    flatten_fn: FlattenFn | None = None,
+    unflatten_fn: UnflattenFn | None = None,
     *,
-    serialized_type_name: Optional[str] = None,
-    to_dumpable_context: Optional[ToDumpableContextFn] = None,
-    from_dumpable_context: Optional[FromDumpableContextFn] = None,
+    serialized_type_name: str | None = None,
+    to_dumpable_context: ToDumpableContextFn | None = None,
+    from_dumpable_context: FromDumpableContextFn | None = None,
     return_none_fields: bool = False,
 ) -> None:
-    assert dataclasses.is_dataclass(
-        cls
-    ), f"Only dataclasses can be registered with this function: {cls}"
+    if not dataclasses.is_dataclass(cls):
+        raise AssertionError(
+            f"Only dataclasses can be registered with this function: {cls}"
+        )
 
+    @torch._dynamo.dont_skip_tracing
     def default_flatten_fn(obj: Any) -> tuple[list[Any], Context]:
         flattened = []
         flat_names = []
@@ -433,10 +529,12 @@ def register_dataclass_as_pytree_node(
                 none_names.append(name)
         return flattened, [flat_names, none_names]
 
+    @torch._dynamo.dont_skip_tracing
     def default_unflatten_fn(values: Iterable[Any], context: Context) -> Any:
         flat_names, none_names = context
         return cls(**dict(zip(flat_names, values)), **dict.fromkeys(none_names))
 
+    @torch._dynamo.dont_skip_tracing
     def default_flatten_fn_with_keys(obj: Any) -> tuple[list[Any], Context]:
         flattened, (flat_names, _none_names) = flatten_fn(obj)  # type: ignore[misc]
         return [(MappingKey(k), v) for k, v in zip(flat_names, flattened)], flat_names
@@ -472,7 +570,7 @@ def is_param(program: "ExportedProgram", node: torch.fx.Node) -> bool:
 def get_param(
     program: "ExportedProgram",
     node: torch.fx.Node,
-) -> Optional[torch.nn.Parameter]:
+) -> torch.nn.Parameter | None:
     """
     Returns the parameter associated with the given node in the exported program.
     Returns None if the node is not a parameter within the exported program
@@ -496,7 +594,7 @@ def is_buffer(program: "ExportedProgram", node: torch.fx.Node) -> bool:
 def get_buffer(
     program: "ExportedProgram",
     node: torch.fx.Node,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """
     Returns the buffer associated with the given node in the exported program.
     Returns None if the node is not a buffer within the exported program
@@ -526,7 +624,7 @@ def is_lifted_tensor_constant(
 def get_lifted_tensor_constant(
     program: "ExportedProgram",
     node: torch.fx.Node,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """
     Returns the lifted tensor constant associated with the given node in the exported program.
     Returns None if the node is not a lifted tensor constant within the exported program
@@ -543,7 +641,7 @@ def get_lifted_tensor_constant(
 
 def sequential_split(
     gm: torch.fx.GraphModule,
-    node_call_back: Callable[[torch.fx.Node], Union[torch.fx.Node, bool]],
+    node_call_back: Callable[[torch.fx.Node], torch.fx.Node | bool],
 ) -> torch.fx.GraphModule:
     """
     sequential_split creates a new graph module that splits the input graph module into multiple submodules
@@ -577,6 +675,65 @@ def nodes_filter(nodes: list[torch.fx.Node], node_call_back) -> list[torch.fx.No
     return [node for node in nodes if node_call_back(node)]
 
 
+@contextmanager
+def _disable_aten_to_metadata_assertions():
+    global _DISABLE_ATEN_TO_ASSERTION_PASS
+    orig_val = _DISABLE_ATEN_TO_ASSERTION_PASS
+    _DISABLE_ATEN_TO_ASSERTION_PASS = True
+    try:
+        yield
+    finally:
+        _DISABLE_ATEN_TO_ASSERTION_PASS = orig_val
+
+
+def _insert_aten_to_metadata_assert_pass(gm: torch.fx.GraphModule) -> None:
+    from torch._export.passes._node_metadata_hook import (
+        _node_metadata_hook,
+        _set_node_metadata_hook,
+    )
+
+    if _DISABLE_ATEN_TO_ASSERTION_PASS:
+        return
+
+    aten_to_variants = [
+        torch.ops.aten.to.device,
+        torch.ops.aten.to.dtype,
+        torch.ops.aten.to.dtype_layout,
+    ]
+    for node in gm.graph.nodes:
+        if node.target in aten_to_variants:
+            if (
+                node.prev.target is torch.ops.aten._assert_tensor_metadata.default
+                and node.args[0] == node.prev.args[0]
+            ):
+                # skip if already guarded
+                continue
+
+            if (tensor_val := node.args[0].meta.get("val")) is not None:
+                with (
+                    gm.graph.inserting_before(node),
+                    _set_node_metadata_hook(
+                        gm,
+                        functools.partial(
+                            _node_metadata_hook,
+                            metadata={
+                                "stack_trace": node.meta.get("stack_trace"),
+                                "nn_module_stack": node.meta.get("nn_module_stack"),
+                            },
+                        ),
+                    ),
+                ):
+                    gm.graph.call_function(
+                        torch.ops.aten._assert_tensor_metadata.default,
+                        args=(node.args[0],),
+                        kwargs={
+                            "dtype": tensor_val.dtype,
+                            "device": tensor_val.device,
+                            "layout": tensor_val.layout,
+                        },
+                    )
+
+
 def apply_runtime_assertion_pass(gm: torch.fx.GraphModule, graph_signature):
     from torch._export.passes._node_metadata_hook import (
         _node_metadata_hook,
@@ -590,7 +747,10 @@ def apply_runtime_assertion_pass(gm: torch.fx.GraphModule, graph_signature):
             "in insert_deferred_runtime_asserts"
         )
         with _set_node_metadata_hook(
-            gm, functools.partial(_node_metadata_hook, stack_trace=stack_trace)
+            gm,
+            functools.partial(
+                _node_metadata_hook, metadata={"stack_trace": stack_trace}
+            ),
         ):
             shape_env = _get_shape_env_from_gm(gm)
             if shape_env:
@@ -600,6 +760,10 @@ def apply_runtime_assertion_pass(gm: torch.fx.GraphModule, graph_signature):
                     f"exported program: {first_call_function_nn_module_stack(gm.graph)}",
                     export=True,
                 )
+
+        # insert runtime assertions for aten.to nodes
+        _insert_aten_to_metadata_assert_pass(gm)
+
     # update output specs
     gm.recompile()
     graph_signature.user_outputs = _graph_output_names(gm)
@@ -608,7 +772,7 @@ def apply_runtime_assertion_pass(gm: torch.fx.GraphModule, graph_signature):
 
 def nodes_first(
     nodes: list[torch.fx.Node], node_call_back=None
-) -> Optional[torch.fx.Node]:
+) -> torch.fx.Node | None:
     """
     Returns the first node that matches the node_call_back. If no node matches, returns None.
     When node_call_back is None, returns the first node in the node list.
@@ -652,16 +816,21 @@ def _update_gm_meta_if_possible(gm: torch.fx.GraphModule, mod: torch.nn.Module) 
         gm.meta.update({"custom": mod.meta["custom"]})
 
 
-def node_inline_(call_mod_node: torch.fx.Node) -> Optional[torch.fx.GraphModule]:
+def node_inline_(call_mod_node: torch.fx.Node) -> torch.fx.GraphModule | None:
     """
     Inline the submodule of the given node into the parent module.
     Note: we only support the case where submodule takes tensors inputs.
     """
-    assert call_mod_node.op == "call_module"
+    if call_mod_node.op != "call_module":
+        raise AssertionError(f"expected call_module op, got {call_mod_node.op}")
     gm = call_mod_node.graph.owning_module
-    assert gm is not None
+    if gm is None:
+        raise AssertionError("owning_module should not be None")
 
-    assert isinstance(call_mod_node.target, str)
+    if not isinstance(call_mod_node.target, str):
+        raise AssertionError(
+            f"expected target to be str, got {type(call_mod_node.target).__name__}"
+        )
     sub_gm = getattr(gm, call_mod_node.target)
 
     phs = (node for node in sub_gm.graph.nodes if node.op == "placeholder")
@@ -671,13 +840,22 @@ def node_inline_(call_mod_node: torch.fx.Node) -> Optional[torch.fx.GraphModule]
     output = [node for node in sub_gm.graph.nodes if node.op == "output"]
 
     for ph, arg in zip(phs, call_mod_node.args):
-        assert isinstance(arg, torch.fx.Node)
+        if not isinstance(arg, torch.fx.Node):
+            raise AssertionError(f"expected fx.Node, got {type(arg)}")
         node_replace_(ph, arg)
 
     with gm.graph.inserting_before(call_mod_node):
         for node in body:
             new_node = gm.graph.node_copy(node)
             if node.op == "get_attr":
+                if not isinstance(new_node.target, str):
+                    raise AssertionError(
+                        f"Expected str target for get_attr, got {type(new_node.target)}"
+                    )
+                if not isinstance(node.target, str):
+                    raise AssertionError(
+                        f"Expected str target for get_attr, got {type(node.target)}"
+                    )
                 new_target_name = new_node.target
                 if hasattr(gm, new_target_name):
                     # Loop through and find the "submod_{i}" that have no name collision
@@ -691,7 +869,10 @@ def node_inline_(call_mod_node: torch.fx.Node) -> Optional[torch.fx.GraphModule]
             node_replace_(node, new_node)
 
         if len(output) > 0:
-            assert len(output) == 1 and len(output[0].args) == 1
+            if len(output) != 1 or len(output[0].args) != 1:
+                raise AssertionError(
+                    f"expected exactly 1 output with 1 arg, got {len(output)} outputs"
+                )
             new_output = output[0].args[0]
 
             if isinstance(new_output, torch.fx.Node):
@@ -708,7 +889,7 @@ def node_inline_(call_mod_node: torch.fx.Node) -> Optional[torch.fx.GraphModule]
                 get_item_users = nodes_filter(
                     list(call_mod_node.users.keys()),
                     lambda node: node.op == "call_function"
-                    and node.target == operator.getitem,
+                    and node.target is operator.getitem,
                 )
                 # get_item_node.args[1] is the idx referring to new_output[idx]
                 nodes_map(
@@ -761,10 +942,11 @@ def _bind_signature_to_inputs(mod, fake_args, fake_kwargs):
         sig = _get_torch_jit_trace_forward_signature(mod)
 
         # Sanity check for placeholder names coming from TorchScript.
-        assert len(sig.parameters) == len(fake_args) + len(fake_kwargs), (
-            "Arguments other than POSITIONAL_OR_KEYWORD kinds in forward() "
-            "are not supported in _get_torch_jit_trace_forward_signature"
-        )
+        if len(sig.parameters) != len(fake_args) + len(fake_kwargs):
+            raise AssertionError(
+                "Arguments other than POSITIONAL_OR_KEYWORD kinds in forward() "
+                "are not supported in _get_torch_jit_trace_forward_signature"
+            )
     else:
         sig = inspect.signature(mod.forward)
 
@@ -775,6 +957,15 @@ def _bind_signature_to_inputs(mod, fake_args, fake_kwargs):
     return {**sig.bind_partial(*fake_args).arguments, **fake_kwargs}
 
 
+def _build_cache(name, find_available, used_names):
+    used_names.add(name)
+    match = re.match(r"(.*)_(\d+)", name)
+    if match:
+        prefix, n = match.group(1), match.group(2)
+        if int(n) > find_available[prefix]:
+            find_available[prefix] = int(n)
+
+
 def _name_hoo_subgraph_placeholders(gm: torch.fx.GraphModule) -> None:
     """
     Propagate placeholder names from the top-level graph into HigherOrderOp subgraphs,
@@ -782,6 +973,7 @@ def _name_hoo_subgraph_placeholders(gm: torch.fx.GraphModule) -> None:
     Different HOO subgraph types have different input schemas, so we first enumerate them
     and gather the top-level named placeholder nodes.
     """
+
     # gather all HOO subgraphs and their top-level named placeholder nodes
     subgraph_ph_tuples: list[tuple[torch.fx.GraphModule, list[torch.fx.Node]]] = []
     for node in gm.graph.nodes:
@@ -805,16 +997,57 @@ def _name_hoo_subgraph_placeholders(gm: torch.fx.GraphModule) -> None:
     # propagate names
     for subgraph, hoo_phs in subgraph_ph_tuples:
         name_map: dict[str, str] = {}
+        find_available: dict[str, int] = defaultdict(int)
+        used_names: set[str] = set()
         for i, node in enumerate(subgraph.graph.nodes):
             if i < len(hoo_phs):  # placeholder, retain name
                 name_map[node.name] = hoo_phs[i].name
                 node.name = node.target = hoo_phs[i].name
+                _build_cache(node.name, find_available, used_names)
             else:  # non-placeholder, check for collisions
-                node.name = _rename_without_collisions(name_map, node.name, node.name)
+                node.name = _rename_without_collisions(
+                    name_map, find_available, used_names, node.name, node.name
+                )
 
         # recurse and recompile
         _name_hoo_subgraph_placeholders(subgraph)
         subgraph.recompile()
+
+
+def _assign_new_node_names(
+    gm: torch.fx.GraphModule,
+    name_map: dict[str, str],
+    custom_meta: dict[str, Any],
+) -> None:
+    """
+    Assign new names to all nodes, in the graph module, from name map.
+    """
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            if node.name not in name_map:
+                raise AssertionError(f"placeholder node {node.name!r} not in name_map")
+            node.name = node.target = name_map[node.name]
+            if node.name in custom_meta:
+                if node.meta.get("custom") is None:
+                    node.meta["custom"] = {}
+                else:
+                    # Assert if any existing key has different value
+                    for k, v in node.meta["custom"].items():
+                        if (
+                            k in custom_meta[node.name]
+                            and v != custom_meta[node.name][k]
+                        ):
+                            raise AssertionError(
+                                f"Mismatch in custom metadata for key {k}. Value in "
+                                f"node.meta is {v} and value in custom_meta is {custom_meta[node.name][k]}."
+                            )
+                node.meta["custom"].update(custom_meta[node.name])
+            # if the constant obj is an input, we also need to update meta["val"]
+            # because this is created before the placeholder naming pass
+            if isinstance(node.meta["val"], CustomObjArgument):
+                node.meta["val"].name = node.name
+        elif node.name in name_map:
+            node.name = name_map[node.name]
 
 
 def placeholder_naming_pass(
@@ -844,6 +1077,12 @@ def placeholder_naming_pass(
             These are named token, token_1, ...
     """
 
+    custom_meta: dict[str, Any] = {}
+    if isinstance(mod, torch.fx.GraphModule):
+        for node in mod.graph.nodes:
+            if "custom" in node.meta:
+                custom_meta[node.name] = node.meta["custom"]
+
     def _strip_name(x):
         if x.startswith("L__self___"):
             x = x[len("L__self___") :]
@@ -864,6 +1103,8 @@ def placeholder_naming_pass(
             raise RuntimeError(f"Pytree key of type {type(x)} not handled for {x}")
 
     name_map: dict[str, str] = {}
+    find_available: dict[str, int] = defaultdict(int)
+    used_names: set[str] = set()
 
     # map user input names with mod.forward() signature
     combined_args = _bind_signature_to_inputs(mod, fake_args, fake_kwargs)
@@ -880,6 +1121,8 @@ def placeholder_naming_pass(
         if user_input_name:
             _rename_without_collisions(
                 name_map,
+                find_available,
+                used_names,
                 user_input_name,
                 placeholder_prefixes[InputKind.USER_INPUT]
                 + "_".join(_extract_pytree_key(x).lower() for x in arg_path),
@@ -899,10 +1142,18 @@ def placeholder_naming_pass(
 
         _rename_without_collisions(
             name_map,
+            find_available,
+            used_names,
             spec.arg.name,
             placeholder_prefixes[spec.kind] + base_name,
             is_placeholder=True,
         )
+        if base_name in custom_meta:
+            # the keys in custom_meta are node names from `mod`,
+            # which is the base_name here.
+            # we need the re-mapped name for lookup later
+            custom_meta[name_map[spec.arg.name]] = custom_meta[base_name]
+            del custom_meta[base_name]
 
     # handle naming collisions with call_function/get_attr inputs.
     # here, we want to prioritize user input names over call_function names
@@ -911,19 +1162,12 @@ def placeholder_naming_pass(
     for node in gm.graph.nodes:
         if node.op == "placeholder":
             continue
-        _rename_without_collisions(name_map, node.name, node.name)
+        _rename_without_collisions(
+            name_map, find_available, used_names, node.name, node.name
+        )
 
     # assign new node names
-    for node in gm.graph.nodes:
-        if node.op == "placeholder":
-            assert node.name in name_map
-            node.name = node.target = name_map[node.name]
-            # if the constant obj is an input, we also need to update meta["val"]
-            # because this is created before the placeholder naming pass
-            if isinstance(node.meta["val"], CustomObjArgument):
-                node.meta["val"].name = node.name
-        elif node.name in name_map:
-            node.name = name_map[node.name]
+    _assign_new_node_names(gm, name_map, custom_meta)
 
     # propagate names to higher order op subgraphs
     _name_hoo_subgraph_placeholders(gm)
@@ -933,17 +1177,20 @@ def placeholder_naming_pass(
 
     # modify graph signature (input specs, output specs, user input mutations)
     for spec in export_graph_signature.input_specs:
-        assert spec.arg.name in name_map
+        if spec.arg.name not in name_map:
+            raise AssertionError(f"input spec arg {spec.arg.name!r} not in name_map")
         spec.arg.name = name_map[spec.arg.name]
         if (  # handle targets for custom objects
             spec.kind == InputKind.CUSTOM_OBJ and spec.target in name_map
         ):
+            # pyrefly: ignore [bad-index, index-error]
             spec.target = name_map[spec.target][4:]  # strip obj_ prefix
 
     for spec in export_graph_signature.output_specs:
         if spec.arg.name in name_map:
             spec.arg.name = name_map[spec.arg.name]
         if spec.kind == OutputKind.USER_INPUT_MUTATION and spec.target in name_map:
+            # pyrefly: ignore [bad-index, index-error]
             spec.target = name_map[spec.target]
 
     # rename keys in constants dict for custom objects
@@ -985,7 +1232,7 @@ def remove_proxy_from_state_dict(state_dict: dict, in_place: bool) -> dict:
 
 def _detect_fake_mode_from_gm(
     gm: torch.fx.GraphModule,
-) -> torch._subclasses.fake_tensor.FakeTensorMode:
+) -> torch._subclasses.fake_tensor.FakeTensorMode | None:
     """
     For a given graph module, we look at the "val" of placeholder nodes to find the fake inputs.
     Additionally, if gm doesn't have placeholders, we further look at the "example_value" or "val" of other nodes.
@@ -1063,7 +1310,8 @@ def _materialize_cpp_cia_ops() -> None:
         namespace, op_name = tuple(op.split("::"))
         split_list = op_name.split(".")
         # Sometime overload could be missing
-        assert len(split_list) == 1 or len(split_list) == 2
+        if len(split_list) not in (1, 2):
+            raise AssertionError(f"expected 1 or 2 parts, got {len(split_list)}")
         op_name = split_list[0]
         op_overload_name = "default"
         if len(split_list) == 2:
@@ -1074,7 +1322,7 @@ def _materialize_cpp_cia_ops() -> None:
 
 def _special_op_to_preserve_cia(*args, **kwargs):
     """
-    This is an special marker that tells our infra that we shouldn't decompose this op.
+    This is a special marker that tells our infra that we shouldn't decompose this op.
     """
     return NotImplemented
 
@@ -1111,16 +1359,16 @@ def _check_valid_to_preserve(op_overload: "OperatorBase"):
 
 @functools.lru_cache(maxsize=1)
 def _collect_all_valid_cia_ops_for_aten_namespace() -> set["OperatorBase"]:
-    return _collect_all_valid_cia_ops_for_namespace("aten")
+    return _collect_all_valid_cia_ops_for_namespace(torch.ops.aten)
 
 
-def _collect_all_valid_cia_ops_for_namespace(namespace: str) -> set["OperatorBase"]:
+def _collect_all_valid_cia_ops_for_namespace(
+    op_namespace: torch._ops._OpNamespace,
+) -> set["OperatorBase"]:
     # Step 1: Materialize all ops from C++ dispatcher
     _materialize_cpp_cia_ops()
 
     # Step 2: Query all ops from python dispatcher
-    assert hasattr(torch.ops, namespace)
-    op_namespace = getattr(torch.ops, namespace)
     cia_ops = set()
     for op in op_namespace:
         op_packet = getattr(op_namespace, op)
@@ -1150,14 +1398,20 @@ def _collect_all_valid_cia_ops() -> set["OperatorBase"]:
     for op_namespace_name in torch.ops._dir:
         # The reason we split here is because aten ops are safe to cache.
         if op_namespace_name != "aten":
-            cia_ops |= _collect_all_valid_cia_ops_for_namespace(op_namespace_name)
+            if not hasattr(torch.ops, op_namespace_name):
+                raise AssertionError(
+                    f"torch.ops does not have attribute {op_namespace_name!r}"
+                )
+            op_namespace = getattr(torch.ops, op_namespace_name)
+            if isinstance(op_namespace, torch._ops._OpNamespace):
+                cia_ops |= _collect_all_valid_cia_ops_for_namespace(op_namespace)
         else:
             cia_ops |= _collect_all_valid_cia_ops_for_aten_namespace()
     return cia_ops
 
 
 def _get_decomp_for_cia(op: "OperatorBase"):
-    # [NOTE] Seperating out func.decompose
+    # [NOTE] Separating out func.decompose
     # Ideally we should be able to just register func.decompose but
     # we can't as this decomp is gonna be registered to the py_impl.
     # As a result it will infinitely recurse. So we first check if the op
@@ -1201,7 +1455,7 @@ def _compiling_state_context():
 def _fakify_params_buffers(
     fake_mode: FakeTensorMode,
     mod: torch.nn.Module,
-) -> dict[str, Union[torch.Tensor, torch.nn.Parameter]]:
+) -> dict[str, torch.Tensor | torch.nn.Parameter]:
     params_buffers = {
         **dict(mod.named_parameters(remove_duplicate=False)),
         **dict(mod.named_buffers(remove_duplicate=False)),
@@ -1233,6 +1487,7 @@ def register_module_as_pytree_input_node(cls: type[torch.nn.Module]) -> None:
 
         import torch
 
+
         class Module(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1241,25 +1496,31 @@ def register_module_as_pytree_input_node(cls: type[torch.nn.Module]) -> None:
             def forward(self, x):
                 return self.linear(x)
 
+
         torch._export.utils.register_module_as_pytree_node(InputDataClass)
+
 
         class Mod(torch.nn.Module):
             def forward(self, x, m):
                 return m(x) + x
 
+
         ep = torch.export.export(Mod(), (torch.randn(3), Module()))
         print(ep)
 
     """
-    assert issubclass(cls, torch.nn.Module)
+    if not issubclass(cls, torch.nn.Module):
+        raise AssertionError(f"expected nn.Module subclass, got {cls}")
 
     import weakref
 
     class PrototypeModule(weakref.ref):
         def __init__(self, m, *args, **kwargs):
-            super().__init__(m, *args, **kwargs)
-            assert isinstance(m, torch.nn.Module)
-            assert not hasattr(self, "_proto_cls")
+            super().__init__(m, *args, **kwargs)  # type: ignore[call-arg]
+            if not isinstance(m, torch.nn.Module):
+                raise AssertionError(f"expected nn.Module, got {type(m).__name__}")
+            if hasattr(self, "_proto_cls"):
+                raise AssertionError("_proto_cls should not be set")
             self._proto_cls = cls
 
         def __eq__(self, other):
@@ -1282,11 +1543,12 @@ def register_module_as_pytree_input_node(cls: type[torch.nn.Module]) -> None:
         if ref is None or ref() is None:
             raise RuntimeError("Module has been garbage collected")
         obj = ref()
-        assert flatten_fn is not None
+        if flatten_fn is None:
+            raise AssertionError("flatten_fn should not be None")
         flattened, _ = flatten_fn(obj)
 
         # NOTE: This helper function will replicate an nn.Module in the exactly same
-        #       structure to be used together with _reparametrize_module. This will
+        #       structure to be used together with _reparameterize_module. This will
         #       create a clone of the module with the new parameters and buffers without
         #       affecting the original module.
         def copy_module(mod: torch.nn.Module):
@@ -1338,7 +1600,8 @@ def register_module_as_pytree_input_node(cls: type[torch.nn.Module]) -> None:
 
     def default_flatten_fn_spec(obj, spec) -> list[Any]:
         flats, context = flatten_fn(obj)
-        assert context == spec.context
+        if context != spec.context:
+            raise AssertionError(f"context mismatch: {context} != {spec.context}")
         return flats
 
     register_pytree_flatten_spec(
@@ -1353,14 +1616,10 @@ def deregister_module_as_pytree_input_node(cls: type[torch.nn.Module]) -> None:
 
 
 def _sync_state(src, dst):
-    assert isinstance(
-        src,
-        torch.nn.Module,
-    ), f"Expected {src} to be a nn.Module"
-    assert isinstance(
-        dst,
-        torch.nn.Module,
-    ), f"Expected {dst} to be a nn.Module"
+    if not isinstance(src, torch.nn.Module):
+        raise AssertionError(f"Expected {src} to be a nn.Module")
+    if not isinstance(dst, torch.nn.Module):
+        raise AssertionError(f"Expected {dst} to be a nn.Module")
     # Share state (params, buffers) between modules.
     # This ensures that state mutations are visible across them.
     # Since tensor constants are not mutable, copying (without sharing) is OK.
@@ -1395,7 +1654,6 @@ def wrap_method(method):
     The wrapped module's forward points to the method, and
     the method's original module state is shared.
     """
-    assert ismethod(
-        method,
-    ), f"Expected {method} to be a method"
+    if not ismethod(method):
+        raise AssertionError(f"Expected {method} to be a method")
     return _WrappedMethod(method)

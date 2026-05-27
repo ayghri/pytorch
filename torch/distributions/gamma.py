@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+
 import torch
 from torch import Tensor
 from torch.distributions import constraints
@@ -32,6 +33,7 @@ class Gamma(ExponentialFamily):
             (often referred to as beta), rate = 1 / scale
     """
 
+    # pyrefly: ignore [bad-override]
     arg_constraints = {
         "concentration": constraints.positive,
         "rate": constraints.positive,
@@ -52,7 +54,12 @@ class Gamma(ExponentialFamily):
     def variance(self) -> Tensor:
         return self.concentration / self.rate.pow(2)
 
-    def __init__(self, concentration, rate, validate_args=None):
+    def __init__(
+        self,
+        concentration: Tensor | float,
+        rate: Tensor | float,
+        validate_args: bool | None = None,
+    ) -> None:
         self.concentration, self.rate = broadcast_all(concentration, rate)
         if isinstance(concentration, _Number) and isinstance(rate, _Number):
             batch_shape = torch.Size()
@@ -102,6 +109,7 @@ class Gamma(ExponentialFamily):
     def _natural_params(self) -> tuple[Tensor, Tensor]:
         return (self.concentration - 1, -self.rate)
 
+    # pyrefly: ignore [bad-override]
     def _log_normalizer(self, x, y):
         return torch.lgamma(x + 1) + (x + 1) * torch.log(-y.reciprocal())
 

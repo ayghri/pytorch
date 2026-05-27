@@ -7,13 +7,14 @@ import logging
 import os
 import queue
 import sys
+import tempfile
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Optional, TYPE_CHECKING, Union
-from typing_extensions import override, Self, TypeGuard
+from typing import Any, TYPE_CHECKING, TypeGuard
+from typing_extensions import final, override, Self
 
-import torch._inductor.async_compile  # noqa: F401 required to warm up AsyncCompile pools
+import torch._inductor.async_compile
 import torch.fx
 from torch._inductor.codecache import BypassFxGraphCache, FxGraphCache
 from torch._inductor.metrics import CachedMetricsDeltas, CachedMetricsHelper
@@ -23,22 +24,46 @@ from torch._inductor.output_code import (
     CompiledFxGraphConstantsWithGm,
     OutputCode,
 )
+from torch._subclasses import FakeTensorMode
 from torch.utils._ordered_set import OrderedSet
 
 from . import config
 from .compile_fx import _CompileFxKwargs, _InProcessFxCompile, FxCompile, log
 from .debug import DebugContext
 from .graph import GraphLowering
-from .output_code import complex_memory_overlap as complex_memory_overlap  # noqa: F401
 from .virtualized import V
 
 
 if TYPE_CHECKING:
     import types
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Generator, Mapping, Sequence
+    from concurrent.futures import Future
 
     from torch._inductor.utils import InputType
     from torch.fx import GraphModule
+
+
+def _graph_contains_triton_kernel_wrappers(gm: GraphModule) -> bool:
+    """
+    Check if the graph contains triton kernel wrapper nodes. These nodes contain
+    references to the kernel_side_table which is process-local and can't be
+    serialized across processes.
+    """
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        triton_kernel_wrapper_functional,
+        triton_kernel_wrapper_mutation,
+    )
+
+    for module in gm.modules():
+        if not isinstance(module, torch.fx.GraphModule):
+            continue
+        for node in module.graph.nodes:
+            if node.target in (
+                triton_kernel_wrapper_functional,
+                triton_kernel_wrapper_mutation,
+            ):
+                return True
+    return False
 
 
 @dataclass
@@ -160,6 +185,24 @@ class _LoweringSerializerContextManager(contextlib.ExitStack):
 
 
 @dataclass
+class _FakeTensorModeSerializer:
+    allow_non_fake_inputs: bool
+
+    def __init__(self, fake_mode: FakeTensorMode) -> None:
+        self.allow_non_fake_inputs = fake_mode.allow_non_fake_inputs
+        self.shape_env = fake_mode.shape_env
+
+    @contextlib.contextmanager
+    def patch(self, fake_mode: FakeTensorMode) -> Generator[None, None, None]:
+        saved_allow_non_fake_inputs = fake_mode.allow_non_fake_inputs
+        fake_mode.allow_non_fake_inputs = self.allow_non_fake_inputs
+
+        yield
+
+        fake_mode.allow_non_fake_inputs = saved_allow_non_fake_inputs
+
+
+@dataclass
 class _WireProtocolInput:
     """
     For _SerializedFxCompile - encapsulates all the data being transferred
@@ -170,14 +213,15 @@ class _WireProtocolInput:
     example_inputs: Sequence[InputType]
     inputs_to_check: Sequence[int]
     graph_kwargs: _CompileFxKwargs
-    tracing_context: Optional[torch._guards.TracingContext]
+    tracing_context: torch._guards.TracingContext | None
     config: dict[str, object]
     virtualized: _VirtualizedSerializer
-    deterministic_guard_for_testing: Optional[
-        torch.testing._internal.common_utils.DeterministicGuard
-    ]
+    deterministic_guard_for_testing: (  # type: ignore[name-defined]  # mypy bug
+        torch.testing._internal.common_utils.DeterministicGuard | None
+    )
     logger_state: _LoggerState
     lowering: _LoweringSerializer
+    fake_tensor_mode: _FakeTensorModeSerializer
 
     def serialize(self) -> _WireProtocolPickledInput:
         """
@@ -189,7 +233,7 @@ class _WireProtocolInput:
         return _WireProtocolPickledInput(GraphPickler.dumps(self))
 
 
-def _current_fake_mode() -> torch._subclasses.FakeTensorMode:
+def _current_fake_mode() -> FakeTensorMode:
     fake_mode = None
     if context := torch._guards.TracingContext.try_get():
         fake_mode = context.fake_mode
@@ -197,7 +241,7 @@ def _current_fake_mode() -> torch._subclasses.FakeTensorMode:
         return fake_mode
 
     shape_env = torch.fx.experimental.symbolic_shapes.ShapeEnv()
-    return torch._subclasses.FakeTensorMode(shape_env=shape_env)
+    return FakeTensorMode(shape_env=shape_env)
 
 
 @dataclass
@@ -226,7 +270,8 @@ class _WireProtocolOutput:
     graph: OutputCode
     metrics: CachedMetricsDeltas
     logs: list[logging.LogRecord]
-    warning_replay: Optional[list[warnings.WarningMessage]]
+    warning_replay: list[warnings.WarningMessage] | None
+    shape_env: torch.fx.experimental.symbolic_shapes.ShapeEnv | None
 
     def serialize(self) -> _WireProtocolPickledOutput:
         """
@@ -268,14 +313,14 @@ class _LoggerState:
     loggers: dict[str, int]
     # The actual log capturing mechanism - this should be None when we're not
     # actively capturing logs.
-    captured_logs: Optional[_CapturedLogs] = None
+    captured_logs: _CapturedLogs | None = None
 
     def __init__(self) -> None:
         # Mapping from logger name to level.
         self.loggers = {}
 
         def filter(
-            logger: Union[logging.Logger, logging.PlaceHolder],
+            logger: logging.Logger | logging.PlaceHolder,
         ) -> TypeGuard[logging.Logger]:
             if not isinstance(logger, logging.Logger):
                 # Assume that Placeholders propagate
@@ -314,9 +359,9 @@ class _LoggerState:
 
     def __exit__(
         self,
-        exc_type: Optional[type[BaseException]],
-        exc_value: Optional[BaseException],
-        traceback: Optional[types.TracebackType],
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: types.TracebackType | None,
     ) -> None:
         assert self.captured_logs is not None
         self.captured_logs.remove()
@@ -330,7 +375,7 @@ class _CapturedLogs:
 
     state: _LoggerState
     queue: queue.Queue[logging.LogRecord]
-    handlers: Optional[dict[str, logging.Handler]]
+    handlers: dict[str, logging.Handler] | None
 
     def __init__(self, state: _LoggerState) -> None:
         self.state = state
@@ -385,18 +430,58 @@ class _SerializedFxCompile(FxCompile):
         inputs_to_check: Sequence[int],
         graph_kwargs: _CompileFxKwargs,
     ) -> OutputCode:
-        def fallback() -> OutputCode:
-            return _InProcessFxCompile().codegen_and_compile(
+        # If this code changes it's likely _AsyncFxCompile.codegen_and_compile()
+        # will also need to match.
+
+        serialized = self.serialize_compile(
+            gm, example_inputs, inputs_to_check, graph_kwargs
+        )
+        if not serialized:
+            eager_compile = _InProcessFxCompile()
+            eager_compile.compile_region_name = self.compile_region_name
+            return eager_compile.codegen_and_compile(
                 gm, example_inputs, inputs_to_check, graph_kwargs
             )
 
+        inputs, constants = serialized
+        output = self._send_to_child(inputs).deserialize(constants)
+        if isinstance(output.graph, CompiledFxGraph):
+            output.graph.compile_region_name = self.compile_region_name
+
+        self._postprocess(output)
+        self._compile_stats[type(self)].codegen_and_compile += 1
+
+        # TODO: Do we need to figure out what changed in TracingContext in the
+        # child and plumb that back up to the parent?
+
+        return output.graph
+
+    def serialize_compile(
+        self,
+        gm: GraphModule,
+        example_inputs: Sequence[InputType],
+        inputs_to_check: Sequence[int],
+        graph_kwargs: _CompileFxKwargs,
+    ) -> tuple[_WireProtocolPickledInput, CompiledFxGraphConstantsWithGm] | None:
+        """
+        Prepare a _WireProtocolInput to compile. If None is returned then it
+        wasn't possible to serialize and we should fallback to in-process.
+        """
         try:
             # _check_for_hop raises BypassFxGraphCache when it detects something
             # we can't cache (or serialize)
             FxGraphCache._check_for_hop(gm)
         except BypassFxGraphCache as e:
             log.debug("Skipping %s compile: %s", type(self), e)
-            return fallback()
+            return None
+
+        # Triton kernel wrapper nodes contain references to the kernel_side_table
+        # which is process-local and can't be serialized across processes.
+        if _graph_contains_triton_kernel_wrappers(gm):
+            log.debug(
+                "Skipping %s compile: graph contains triton kernel wrappers", type(self)
+            )
+            return None
 
         context = torch._guards.TracingContext.try_get()
         constants = CompiledFxGraphConstantsWithGm(gm)
@@ -405,15 +490,20 @@ class _SerializedFxCompile(FxCompile):
 
         # If we're running tests then grab the DeterministicGuard (don't want to
         # import this if it isn't already imported because it has side-effects)
-        deterministic_guard_for_testing: Optional[
-            torch.testing._internal.common_utils.DeterministicGuard
-        ] = None
+        deterministic_guard_for_testing: (  # type: ignore[name-defined]  # mypy bug
+            torch.testing._internal.common_utils.DeterministicGuard | None
+        ) = None
         try:
             deterministic_guard_for_testing = (
-                torch.testing._internal.common_utils.DeterministicGuard._current_state()
+                torch.testing._internal.common_utils.DeterministicGuard._current_state()  # type: ignore[attr-defined]  # mypy bug
             )
         except AttributeError:
             pass
+
+        fake_mode = _current_fake_mode()
+        fake_tensor_mode = _FakeTensorModeSerializer(fake_mode)
+
+        from pickle import PicklingError
 
         try:
             input = _WireProtocolInput(
@@ -427,25 +517,17 @@ class _SerializedFxCompile(FxCompile):
                 deterministic_guard_for_testing,
                 logger_state,
                 lowering,
+                fake_tensor_mode,
             ).serialize()
-        except (AttributeError, BypassFxGraphCache):
+            return (input, constants)
+        except (AttributeError, BypassFxGraphCache, PicklingError):
             # For example: AttributeError: Can't pickle local object
             # 'make_opaque_unary_fn.<locals>.OpaqueUnaryFn'
 
             # TODO: scuba record about not being able to do this?
-            log.debug("Unable to pickle input graph or example inputs", exc_info=True)
+            log.warning("Unable to pickle input graph or example inputs", exc_info=True)
 
-            return fallback()
-
-        output = self._send_to_child(input).deserialize(constants)
-
-        self._postprocess(output)
-        self._compile_stats[type(self)].codegen_and_compile += 1
-
-        # TODO: Do we need to figure out what changed in TracingContext in the
-        # child and plumb that back up to the parent?
-
-        return output.graph
+            return None
 
     @abstractmethod
     def _send_to_child(
@@ -462,7 +544,7 @@ class _SerializedFxCompile(FxCompile):
     def _run_in_child(
         cls,
         pickled_input: _WireProtocolPickledInput,
-        extra_env: Optional[Mapping[str, str]] = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> _WireProtocolPickledOutput:
         metrics = CachedMetricsHelper()
 
@@ -490,6 +572,9 @@ class _SerializedFxCompile(FxCompile):
             stack.enter_context(torch._guards.tracing(input.tracing_context))
             stack.enter_context(DebugContext())
 
+            fake_mode = _current_fake_mode()
+            stack.enter_context(input.fake_tensor_mode.patch(fake_mode))
+
             output_graph = _InProcessFxCompile().codegen_and_compile(
                 input.gm,
                 input.example_inputs,
@@ -500,12 +585,17 @@ class _SerializedFxCompile(FxCompile):
         logs = captured_logs.finish()
 
         return _WireProtocolOutput(
-            output_graph, metrics.get_deltas(), logs, warning_replay
+            output_graph,
+            metrics.get_deltas(),
+            logs,
+            warning_replay,
+            fake_mode.shape_env,
         ).serialize()
 
 
 # This is a debugging/testing implementation of FxCompile which serializes the
 # input and output but still runs the FxCompile in-process.
+@final
 class _DebugSerdeFxCompile(_SerializedFxCompile):
     @override
     def _send_to_child(
@@ -521,6 +611,29 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
     Represents an FxCompile which is run outside the current process (in
     either a subprocess or possibly even a separate machine).
     """
+
+    @override
+    @final
+    def _send_to_child(
+        self, pickled_input: _WireProtocolPickledInput
+    ) -> _WireProtocolPickledOutput:
+        f = self._send_to_child_async(pickled_input)
+
+        # For debugging: If we want to print status updates...
+        # last = time.time()
+        # while not f.done():
+        #     print("tick...")
+        #     time.sleep(0.125)
+        #     now = time.time()
+        #     if now - last > 1:
+        #         last = now
+
+        return f.result()
+
+    @abstractmethod
+    def _send_to_child_async(
+        self, pickled_input: _WireProtocolPickledInput
+    ) -> Future[_WireProtocolPickledOutput]: ...
 
     def _postprocess(self, output: _WireProtocolOutput) -> None:
         # Since our metrics were gathered in a subprocess make sure to add them
@@ -538,7 +651,7 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
 
         # And forward our collected logs. The cache is cleared when the outer
         # function exits.
-        @functools.lru_cache(None)
+        @functools.cache
         def getLogger(name: str) -> logging.Logger:
             return logging.getLogger(name)
 
@@ -573,7 +686,8 @@ class _OutOfProcessFxCompile(_SerializedFxCompile):
 #     with open(f"/tmp/pytorch_compile_fx_tmp_output_{idx}.bin", "wb") as f:
 #         f.write(result.value)
 #
-class _DebugFileFxCompile(_OutOfProcessFxCompile):
+@final
+class _DebugFileFxCompile(_SerializedFxCompile):
     file_index = 0
 
     @override
@@ -583,19 +697,25 @@ class _DebugFileFxCompile(_OutOfProcessFxCompile):
         idx = _DebugFileFxCompile.file_index
         _DebugFileFxCompile.file_index += 1
 
-        name = f"/tmp/aorenste/pytorch_compile_fx_tmp_input_{idx}.bin"
+        name = os.path.join(
+            tempfile.gettempdir(), f"pytorch_compile_fx_tmp_input_{idx}.bin"
+        )
         with open(name, "wb") as f:
             f.write(pickled_input.value)
         print(f"Wrote to {name}")
 
         if False:
-            name = f"/tmp/aorenste/pytorch_compile_fx_tmp_actual_{idx}.bin"
+            name = os.path.join(
+                tempfile.gettempdir(), f"pytorch_compile_fx_tmp_actual_{idx}.bin"
+            )
             actual = self._run_in_child(pickled_input)
             with open(name, "wb") as f:
                 f.write(actual.value)
             return actual
         elif False:
-            name = f"/tmp/aorenste/pytorch_compile_fx_tmp_output_{idx}.bin"
+            name = os.path.join(
+                tempfile.gettempdir(), f"pytorch_compile_fx_tmp_output_{idx}.bin"
+            )
             with open(name, "rb") as f:
                 result = _WireProtocolPickledOutput(f.read())
                 print(f"Read from {name}")

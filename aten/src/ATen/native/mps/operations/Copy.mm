@@ -2,7 +2,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/mps/Copy.h>
-#include <ATen/native/mps/MPSGraphSonomaOps.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/ops/_copy_from_and_resize_native.h>
 #include <ATen/ops/_copy_from_native.h>
@@ -11,6 +10,7 @@
 #include <ATen/ops/real.h>
 #include <ATen/ops/view_as_real.h>
 #include <ATen/ops/zeros_like.h>
+#include <fmt/format.h>
 
 namespace at::native {
 namespace mps {
@@ -48,8 +48,9 @@ static void copy_cast_mps(at::Tensor& dst,
 
   @autoreleasepool {
     const bool needs_conj = src.is_conj() != dst.is_conj();
-    string key = "copy_cast_mps" + getTensorsStringKey({src, dst}, true, /*exclude_shape*/ true) + ":" +
-        std::to_string(needs_conj);
+    const bool needs_neg = src.is_neg() != dst.is_neg();
+    std::string key = fmt::format(
+        "copy_cast_mps{}:{}:{}", getTensorsStringKey({src, dst}, true, /*exclude_shape*/ true), needs_conj, needs_neg);
     auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
       MPSGraphTensor* inputTensor = mpsGraphUnrankedPlaceHolder(mpsGraph, srcDType);
       auto outputTensor = inputTensor;
@@ -60,8 +61,10 @@ static void copy_cast_mps(at::Tensor& dst,
         outputTensor = [mpsGraph castTensor:outputTensor toType:dstDType name:@"cast"];
       }
       if (needs_conj) {
-        TORCH_CHECK(supportsComplex(), "MPS complex tensors conjugation needs MacOS14+");
         outputTensor = [mpsGraph conjugateWithTensor:outputTensor name:nil];
+      }
+      if (needs_neg) {
+        outputTensor = [mpsGraph negativeWithTensor:outputTensor name:nil];
       }
 
       newCachedGraph->inputTensor_ = inputTensor;
@@ -118,10 +121,15 @@ static at::Tensor& copy_from_mps_(at::Tensor& dst_, const at::Tensor& src_, bool
     // 4 bytes alignment required on macos for blits.
     TORCH_INTERNAL_ASSERT(destOffset % 4 == 0, "Unaligned blit request");
 
+    // Only capture on non_blocking - capturing across waitUntilCompleted would
+    // deadlock Metal's completion thread on the GIL.
+    auto* dst_storage = non_blocking ? new c10::Storage(dst.storage()) : nullptr;
     id<MTLBuffer> destBuffer = [device newBufferWithBytesNoCopy:alignedPtr
                                                          length:alignedLength
                                                         options:options
-                                                    deallocator:nil];
+                                                    deallocator:^(void*, NSUInteger) {
+                                                      delete dst_storage;
+                                                    }];
     id<MTLBuffer> maybeCastedSourceBuffer = sourceBuffer;
     Tensor maybeCastedSource;
     bool needsBlit = true;
@@ -178,10 +186,14 @@ static void copy_to_mps_stride_contig(at::Tensor& dst, const at::Tensor& src, bo
 
     void* alignedPtr = pageAlignedBlockPtr(host_src, (NSUInteger)size_to_copy, &alignedLength);
     sourceOffset = uintptr_t(host_src) - uintptr_t(alignedPtr);
+    // See note in copy_from_mps_ above.
+    auto* src_storage = non_blocking ? new c10::Storage(src.storage()) : nullptr;
     id<MTLBuffer> sourceBuffer = [device newBufferWithBytesNoCopy:alignedPtr
                                                            length:alignedLength
                                                           options:options
-                                                      deallocator:nil];
+                                                      deallocator:^(void*, NSUInteger) {
+                                                        delete src_storage;
+                                                      }];
 
     uint64_t profile_id =
         getMPSProfiler().beginProfileCopy(sourceBuffer, destBuffer, src, dst, size_to_copy, non_blocking);
@@ -231,12 +243,13 @@ static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, boo
   auto dst_byte_offset = dst_.storage_offset() * dst_.itemsize();
 
   // If dst is contiguous and there is no byte offset, we can save directly the result of
-  // gather into dst. This reduces the overhead of doing an additional blit for most cases
+  // gather into dst. This reduces the overhead of doing an additional blit for most cases.
   bool returnGatherOutput = dst_.is_contiguous();
   Tensor src;
   auto sameMemFormat =
       src_.is_contiguous(dst_.suggest_memory_format()) && dst_.is_contiguous(dst_.suggest_memory_format());
-  const bool sameDataType = src_.dtype() == dst_.dtype() && src_.is_conj() == dst_.is_conj();
+  const bool sameDataType =
+      src_.dtype() == dst_.dtype() && src_.is_conj() == dst_.is_conj() && src_.is_neg() == dst_.is_neg();
 
   if ((!src_.is_contiguous(MemoryFormat::Contiguous) && !sameMemFormat) ||
       // the copy_cast path requires storage_offset to be applied before casting
@@ -275,24 +288,7 @@ static at::Tensor& copy_kernel_mps(at::Tensor& dst_, const at::Tensor& src_, boo
     // for GPU to GPU copies we only encode to stream's command buffer (no flushing)
     stream->copy(sourceBuffer, destBuffer, src.nbytes(), src_byte_offset, dst_byte_offset, profile_id);
   } else {
-    // Simulate cast to Complex on older MacOS by initializing real and imag parts
-    if (dst_.is_complex() && !supportsComplex()) {
-      if (!src.is_complex()) {
-        at::real(dst_).copy_(src);
-        at::imag(dst_).fill_(0);
-      } else if (src.is_conj() || dst_.is_conj()) {
-        // One cannot take view of conjugated tensor, but for some reason real and imag views are fine
-        // Use this to implement a conjugation
-        at::real(dst_).copy_(at::real(src));
-        if (src.is_conj() != dst_.is_conj()) {
-          at::imag(dst_).copy_(at::neg(at::imag(src)));
-        } else {
-          at::imag(dst_).copy_(at::imag(src));
-        }
-      } else {
-        at::view_as_real(dst_).copy_(at::view_as_real(src));
-      }
-    } else if (dst_byte_offset) {
+    if (dst_byte_offset) {
       auto maybeCastedSource =
           at::empty(dst_.sizes(), dst_.scalar_type(), std::nullopt, kMPS, std::nullopt, std::nullopt);
       auto maybeCastedSourceBuffer = getMTLBufferStorage(maybeCastedSource);
@@ -352,6 +348,7 @@ at::Tensor& mps_copy_(at::Tensor& dst, const at::Tensor& src, bool non_blocking)
 } // namespace mps
 
 Tensor _copy_from_and_resize_mps(const at::Tensor& self, const at::Tensor& dst) {
+  const_cast<Tensor&>(dst).resize_as_(self);
   return mps::mps_copy_(const_cast<Tensor&>(dst), self, false);
 }
 

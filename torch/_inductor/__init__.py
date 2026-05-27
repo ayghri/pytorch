@@ -1,18 +1,23 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import dataclasses
 import io
 import logging
 import os
-from typing import Any, IO, Optional, TYPE_CHECKING, Union
+from typing import Any, IO, Literal, Optional, TYPE_CHECKING, Union
 
-import torch._inductor.config
 import torch.fx
+
+from .standalone_compile import CompiledArtifact, DynamicShapesType  # noqa: TC001
 
 
 if TYPE_CHECKING:
     from torch._inductor.utils import InputType
+    from torch._subclasses import FakeTensorMode
     from torch.export import ExportedProgram
+    from torch.export.pt2_archive._package import AOTICompiledModel
+    from torch.export.pt2_archive._package_weights import Weights
     from torch.types import FileLike
 
 __all__ = [
@@ -20,6 +25,7 @@ __all__ = [
     "list_mode_options",
     "list_options",
     "cudagraph_mark_step_begin",
+    "standalone_compile",
 ]
 
 
@@ -29,7 +35,7 @@ log = logging.getLogger(__name__)
 def compile(
     gm: torch.fx.GraphModule,
     example_inputs: list[InputType],
-    options: Optional[dict[str, Any]] = None,
+    options: dict[str, Any] | None = None,
 ):
     """
     Compile a given FX graph with TorchInductor.  This allows compiling
@@ -53,8 +59,8 @@ def aoti_compile_and_package(
     _deprecated_unused_args=None,
     _deprecated_unused_kwargs=None,
     *,
-    package_path: Optional[FileLike] = None,
-    inductor_configs: Optional[dict[str, Any]] = None,
+    package_path: FileLike | None = None,
+    inductor_configs: dict[str, Any] | None = None,
 ) -> str:
     """
     Compiles the exported program with AOTInductor, and packages it into a .pt2
@@ -156,12 +162,12 @@ def _aoti_compile_and_package_inner(
     gm: torch.nn.Module,
     # flat_example_inputs: List[Any],
     args: tuple[Any],
-    kwargs: Optional[dict[str, Any]] = None,
+    kwargs: dict[str, Any] | None = None,
     *,
     load_and_run: bool = False,
-    check_accuracy: Optional[str] = None,
-    package_path: Optional[Union[str, io.BytesIO]] = None,
-    inductor_configs: Optional[dict[str, Any]] = None,
+    check_accuracy: str | None = None,
+    package_path: str | io.BytesIO | None = None,
+    inductor_configs: dict[str, Any] | None = None,
 ):
     """
     See docstring for aoti_compile_and_package.
@@ -194,13 +200,13 @@ def _aoti_compile_and_package_inner(
         path = [
             os.path.splitext(file)[0]
             for file in aoti_files
-            if os.path.splitext(file)[1] == ".so"
+            if isinstance(file, str) and os.path.splitext(file)[1] == ".so"
         ]
         if len(path) == 0:
             path = [
                 os.path.splitext(file)[0]
                 for file in aoti_files
-                if os.path.splitext(file)[1] == ".cpp"
+                if isinstance(file, str) and os.path.splitext(file)[1] == ".cpp"
             ]
         package_path = path[0] + ".pt2"
 
@@ -219,7 +225,7 @@ def _aoti_compile_and_package_inner(
             not_strict_accuracy = check_accuracy == "accuracy"
             if not same_two_models(
                 gm,
-                compiled_model,
+                compiled_model,  # type: ignore[arg-type]
                 args,
                 only_fwd=True,
                 require_fp64=not_strict_accuracy,
@@ -232,7 +238,9 @@ def _aoti_compile_and_package_inner(
     return package_path
 
 
-def aoti_load_package(path: FileLike) -> Any:  # type: ignore[type-arg]
+def aoti_load_package(
+    path: FileLike, run_single_threaded: bool = False, device_index: int = -1
+) -> AOTICompiledModel:
     """
     Loads the model from the PT2 package.
 
@@ -248,19 +256,28 @@ def aoti_load_package(path: FileLike) -> Any:  # type: ignore[type-arg]
 
     Args:
         path: Path to the .pt2 package
+        run_single_threaded (bool): Whether the model should be run without
+            thread synchronization logic. This is useful to avoid conflicts with
+            CUDAGraphs.
+        device_index (int): The index of the device to which the PT2 package is
+            to be loaded. By default, `device_index=-1` is used, which corresponds
+            to the device `cuda` when using CUDA. Passing `device_index=1` would
+            load the package to `cuda:1`, for example.
     """
     from torch._inductor.package import load_package
 
-    return load_package(path)
+    return load_package(
+        path, run_single_threaded=run_single_threaded, device_index=device_index
+    )
 
 
 def aot_compile(
     gm: torch.fx.GraphModule,
-    args: tuple[Any],
-    kwargs: Optional[dict[str, Any]] = None,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any] | None = None,
     *,
-    options: Optional[dict[str, Any]] = None,
-) -> Union[str, list[str]]:
+    options: dict[str, Any] | None = None,
+) -> str | list[str | Weights] | torch.fx.GraphModule:
     """
     Ahead-of-time compile a given FX graph with TorchInductor into a shared library.
 
@@ -277,19 +294,49 @@ def aot_compile(
     """
     from .compile_fx import _aoti_flatten_inputs, compile_fx_aot
 
+    if hasattr(gm, "_guards_fn"):
+        # Do not compile the guards function, since it may contain checks
+        # that are not currently supported by AOTI. In particular, non-Tensor
+        # arguments are converted to None and will fail specialization checks.
+        node = next(iter(gm.graph.find_nodes(op="call_module", target="_guards_fn")))
+        gm.graph.erase_node(node)
+        delattr(gm, "_guards_fn")
+        gm.recompile()
+
     flat_example_inputs, options = _aoti_flatten_inputs(
         gm, args, kwargs, options=options
     )
+    from torch._export.utils import _compiling_state_context
 
-    return compile_fx_aot(
-        gm,
-        flat_example_inputs,  # type: ignore[arg-type]
-        config_patches=options,
-    )
+    with _compiling_state_context():
+        return compile_fx_aot(
+            gm,
+            flat_example_inputs,  # type: ignore[arg-type]
+            config_patches=options,
+        )
+
+
+lite_mode_options = {
+    # Fallback by default unless users explicitly annotated with
+    # regional inductor compile.
+    "fallback_by_default": True,
+    "selective_decompose": True,
+    # Disable reorder optimizations
+    "reorder_for_peak_memory": False,
+    "reorder_for_compute_comm_overlap": False,
+    "triton.reorder_for_reducing_graph_partitions": False,
+    # Disable pre-, joint-, post-grad passes
+    "use_pre_grad_passes": False,
+    "use_joint_graph_passes": False,
+    "use_post_grad_passes": False,
+    # Disable dead code elimination (dce) and buffer reuse
+    "use_dce": False,
+    "allow_buffer_reuse": False,
+}
 
 
 def list_mode_options(
-    mode: Optional[str] = None, dynamic: Optional[bool] = None
+    mode: str | None = None, dynamic: bool | None = None
 ) -> dict[str, Any]:
     r"""Returns a dictionary describing the optimizations that each of the available
     modes passed to `torch.compile()` performs.
@@ -305,6 +352,8 @@ def list_mode_options(
 
     mode_options: dict[str, dict[str, bool]] = {
         "default": {},
+        # lite backend for opt-in optimizations
+        "lite": lite_mode_options,
         # enable cudagraphs
         "reduce-overhead": {
             "triton.cudagraphs": True,
@@ -353,3 +402,65 @@ def cudagraph_mark_step_begin():
     from .cudagraph_trees import mark_step_begin
 
     mark_step_begin()
+
+
+def standalone_compile(
+    gm: torch.fx.GraphModule,
+    example_inputs: list[InputType],
+    *,
+    dynamic_shapes: DynamicShapesType = "from_graph",
+    options: dict[str, Any] | None = None,
+    aot: bool = False,  # AOT mode, which uses BundledAOTAutogradCache
+    donate_graph_module: bool = False,
+    fake_mode: FakeTensorMode | None = None,
+) -> CompiledArtifact:
+    """
+    Precompilation API for inductor.
+
+    .. code-block:: python
+
+        compiled_artifact = torch._inductor.standalone_compile(gm, args)
+        compiled_artifact.save(path=path, format="binary")
+
+        # Later on a new process
+        loaded = torch._inductor.CompiledArtifact.load(path=path, format="binary")
+        compiled_out = loaded(*args)
+
+    Args:
+        gm: Graph Module
+        example_inputs: Inputs for the graph module
+        dynamic_shapes: If "from_graph" (default), we will use the dynamic
+            shapes in the passed-in graph module.
+            If "from_tracing_context", we use the dynamic shape info in the
+            ambient tracing context.
+            If "from_example_inputs", we will specialize the graph on the
+            example_inputs.
+        options: Inductor compilation options
+        donate_graph_module: If True, standalone_compile takes ownership of
+            the graph module and may mutate it, avoiding an internal deepcopy.
+            Defaults to False for backwards compatibility.
+        fake_mode: Optional FakeTensorMode to use when
+            dynamic_shapes="from_example_inputs". The mode must have a ShapeEnv.
+            When omitted, a fresh FakeTensorMode is created as before.
+
+    Returns:
+        CompiledArtifact that can be saved to disk or invoked directly.
+    """
+    from .standalone_compile import standalone_compile
+
+    options = options if options else {}
+    return standalone_compile(
+        gm,
+        example_inputs,
+        dynamic_shapes=dynamic_shapes,
+        options=options,
+        aot=aot,
+        donate_graph_module=donate_graph_module,
+        fake_mode=fake_mode,
+    )
+
+
+@dataclasses.dataclass
+class _CudagraphAnnotation:
+    fwd: bool | None
+    bwd: bool | None

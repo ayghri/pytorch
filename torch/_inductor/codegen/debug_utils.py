@@ -5,7 +5,7 @@ import functools
 import logging
 import os
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch import dtype as torch_dtype
@@ -13,6 +13,10 @@ from torch import dtype as torch_dtype
 from .. import config
 from ..virtualized import V
 from .multi_kernel import MultiKernel
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 log = logging.getLogger(__name__)
@@ -23,17 +27,23 @@ def _print_debugging_tensor_value_info(msg, arg):
     # at jit inductor level codegen
     max_numel_to_print = 64
     print(msg)
-    numel = arg.float().numel()
+    if not isinstance(arg, torch.Tensor):
+        print("Value: ", arg)
+        return
+    numel = arg.numel()
     # print the debug printing stats
     if numel <= max_numel_to_print:
         print(arg)
     print("Number of elements: ", numel)
-    print("Size: ", arg.float().size())
-    print("Dtype: ", arg.float().mean().item())
-    print("Mean: ", arg.float().mean().item())
-    print("Min: ", arg.float().min().item())
-    print("Max: ", arg.float().max().item())
-    print("Std: ", arg.float().std().item())
+    print("Size: ", arg.size())
+    print("Dtype: ", arg.dtype)
+    arg_f = arg.float()
+    std, mean = torch.std_mean(arg_f)
+    amin, amax = torch.aminmax(arg_f)
+    print("Mean: ", mean.item())
+    print("Min: ", amin.item())
+    print("Max: ", amax.item())
+    print("Std: ", std.item())
 
 
 # AOTI debug printing related configs
@@ -54,10 +64,11 @@ class DebugPrinterManager:
         self,
         debug_printer_level,
         use_array_ref: bool,
-        args_to_print_or_save: Optional[list[str]] = None,
+        writeline: Callable[..., None] | None = None,
+        args_to_print_or_save: list[str] | None = None,
         kernel_name: str = "",
         kernel=None,
-        arg_signatures: Optional[list[type]] = None,
+        arg_signatures: list[type] | None = None,
         kernel_type=None,
     ):
         self.debug_printer_level = IntermediateValueDebuggingLevel(debug_printer_level)
@@ -66,7 +77,7 @@ class DebugPrinterManager:
             args_to_print_or_save = []
         self.args_to_print_or_save = args_to_print_or_save
         self.kernel_name = kernel_name
-        self.arg_signatures: Optional[list[type]] = None
+        self.arg_signatures: list[type] | None = None
         self.kernel = kernel
         self.filtered_kernel_names_to_print = self._get_debug_filtered_kernel_names()
         self.kernel_type = None
@@ -92,7 +103,7 @@ class DebugPrinterManager:
         args_to_print_or_save,
         kernel_name,
         before_launch,
-        arg_signatures: Optional[list[type]] = None,
+        arg_signatures: list[type] | None = None,
     ):
         if self.debug_printer_level == IntermediateValueDebuggingLevel.OFF:
             return
@@ -136,7 +147,7 @@ class DebugPrinterManager:
         self,
         args_to_print_or_save: list[str],
         kernel_name: str,
-        arg_signatures: Optional[list[type]],
+        arg_signatures: list[type] | None,
         kernel,
         kernel_type=None,
     ):
@@ -153,7 +164,9 @@ class DebugPrinterManager:
         # TODO: Find a more reliable way to detect kernel args types to print for extern kernel calls
         if kernel_type == "extern":
             args_to_print_or_save_extern = [
-                arg for arg in args_to_print_or_save if arg.startswith(("buf", "arg"))
+                arg
+                for arg in args_to_print_or_save
+                if isinstance(arg, str) and arg.startswith(("buf", "arg"))
             ]
             self.args_to_print_or_save = args_to_print_or_save_extern
         elif kernel_type == "cpp":
@@ -164,7 +177,7 @@ class DebugPrinterManager:
                     else arg
                 )
                 for arg in args_to_print_or_save
-                if arg.startswith(("buf", "arg"))
+                if isinstance(arg, str) and arg.startswith(("buf", "arg"))
             ]
         else:
             self.args_to_print_or_save = args_to_print_or_save
@@ -186,7 +199,7 @@ class DebugPrinterManager:
         args_to_save,
         kernel_name,
         before_launch=True,
-        arg_signatures: Optional[list[type]] = None,
+        arg_signatures: list[type] | None = None,
     ) -> None:
         for i, arg in enumerate(args_to_save):
             if arg_signatures is not None and not isinstance(
@@ -223,7 +236,7 @@ class DebugPrinterManager:
         args_to_print,
         kernel_name,
         before_launch=True,
-        arg_signatures: Optional[list[type]] = None,
+        arg_signatures: list[type] | None = None,
     ) -> None:
         launch_prefix = "before_launch" if before_launch else "after_launch"
 
@@ -251,7 +264,7 @@ class DebugPrinterManager:
                 continue
             if V.graph.cpp_wrapper:
                 if arg_signatures is not None and isinstance(
-                    arg_signatures[i], (torch_dtype)
+                    arg_signatures[i], torch_dtype
                 ):
                     # infer from the arg data type (has torch.dtype) to see if it is a tensor type
                     V.graph.wrapper_code.writeline(
@@ -270,7 +283,7 @@ class DebugPrinterManager:
                         f'printf("[  {launch_prefix} - {kernel_name} - {arg}: %ld  ]", {arg}); printf("\\\\n");'
                     )
                 else:
-                    if arg_signatures is None and self.kernel_type == "cpp" or "extern":
+                    if arg_signatures is None and self.kernel_type in ("cpp", "extern"):
                         V.graph.wrapper_code.writeline(
                             f'aoti_torch_print_tensor_handle({arg}, "{launch_prefix} - {kernel_name} - {arg}");'
                         )

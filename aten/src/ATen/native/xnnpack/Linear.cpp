@@ -87,9 +87,9 @@ ContextLinear create(
       weight_contig.size(Layout::Filter::output),                       // output_channels
       weight_contig.size(Layout::Filter::input),                        // input_pixel_stride
       weight_contig.size(Layout::Filter::output),                       // output_pixel_stride
-      weight_contig.data_ptr<float>(),                                  // kernel
+      weight_contig.const_data_ptr<float>(),                            // kernel
       (bias && bias->defined()) ?
-          bias->contiguous().data_ptr<float>() :
+          bias->contiguous().const_data_ptr<float>() :
           nullptr,                                                      // bias
       output_min,                                                     // output_min
       output_max,                                                     // output_max
@@ -129,6 +129,7 @@ Tensor run(
 
   const IntArrayRef input_size = padded_input.sizes();
   std::vector<int64_t> output_size(input_size.cbegin(), input_size.cend());
+  // NOLINTNEXTLINE(facebook-hte-LocalUncheckedArrayBounds)
   output_size.back() = context.output_channels;
 
   Tensor output = mobile::empty_with_tail_padding(
@@ -148,7 +149,7 @@ Tensor run(
 
   const xnn_status setup_status = xnn_setup_fully_connected_nc_f32(
       context.op.get(),                                   // operator
-      padded_input.data_ptr<float>(),                     // input
+      padded_input.const_data_ptr<float>(),                     // input
       output.data_ptr<float>());                          // output
 
   TORCH_CHECK(

@@ -16,10 +16,9 @@
 #include <torch/csrc/jit/runtime/interpreter/preprocess_graph.h>
 
 TORCH_DECLARE_bool(torch_jit_enable_expanded_stacks);
+TORCH_DECLARE_bool(torch_jit_expanded_stacks_mangled);
 
-namespace torch::jit {
-
-namespace interpreter {
+namespace torch::jit::interpreter {
 
 template <class Ttarget, class Tsource>
 Ttarget safe_narrow_cast(Tsource v) {
@@ -63,7 +62,7 @@ struct NodeSourceInfo {
   const char* func_name_{nullptr};
   const char* file_name_{nullptr};
   size_t line_{0};
-  NodeSourceInfo() {}
+  NodeSourceInfo() = default;
 };
 
 struct CodeImpl {
@@ -227,7 +226,7 @@ struct CodeImpl {
   NodeSourceInfo getSourceInfoFromSourceRange(const SourceRange& range) {
     NodeSourceInfo nodeSource;
     SourceRange r = range;
-    if (range.source()) {
+    if (!FLAGS_torch_jit_expanded_stacks_mangled && range.source()) {
       if (auto orig = range.source()->findSourceRangeThatGenerated(r)) {
         r = *orig;
       }
@@ -447,7 +446,7 @@ struct CodeImpl {
     // check if the node should be emitted as instruction or operator
     const Operator& op = node->getOperator();
     std::string unique_op_name = c10::toString(op.schema().operator_name());
-    if (unique_op_name.find("aten::__getitem__.Dict") == 0) {
+    if (unique_op_name.starts_with("aten::__getitem__.Dict")) {
       // __get_item__ overloaded operator for Dict
       // needs to be emitted an instruction
       emitOperatorOrInstruction(node, DICT_INDEX);
@@ -867,17 +866,17 @@ struct CodeImpl {
   }
 
   void dump(std::ostream& out, size_t i) const {
-    out << i << " " << instructions_[i];
+    out << i << ' ' << instructions_[i];
     if (instructions_[i].op == OP || instructions_[i].op == CALL ||
         instructions_[i].op == OPN) {
       out << " # " << *instructions_source_[i];
     } else {
-      out << "\n";
+      out << '\n';
     }
   }
 
   void dump(std::ostream& out) const {
-    out << *graph_ << "\n";
+    out << *graph_ << '\n';
     for (const auto i : c10::irange(instructions_.size())) {
       dump(out, i);
     }
@@ -1059,5 +1058,4 @@ struct MobileCodeImpl : CodeImpl {
   bool emit_promoted_ops_;
 };
 
-} // namespace interpreter
-} // namespace torch::jit
+} // namespace torch::jit::interpreter

@@ -1,5 +1,6 @@
 # Owner(s): ["module: unknown"]
 
+import unittest
 from functools import partial
 from textwrap import dedent
 
@@ -18,7 +19,9 @@ from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.common_utils import (
     clone_input_helper,
     first_sample,
+    IS_LINUX,
     IS_SANDCASTLE,
+    IS_WINDOWS,
     run_tests,
     TestCase,
     unMarkDynamoStrictTest,
@@ -54,6 +57,10 @@ class TestJit(JitCommonTestCase):
     #   same values for the cross-product of op variants (function, method, inplace)
     #   and runtimes (eager, traced, scripted).
     # TODO WARNING: inplace x {traced, scripted} not currently tested
+    @unittest.skipIf(
+        IS_LINUX or IS_WINDOWS, "https://github.com/pytorch/pytorch/issues/95412"
+    )
+    @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/179743")
     @_variant_ops(op_db)
     def test_variant_consistency_jit(self, device, dtype, op):
         _requires_grad = dtype in op.supported_backward_dtypes(
@@ -119,7 +126,8 @@ class TestJit(JitCommonTestCase):
                     )
                     raise Exception(variant_error_info) from e  # noqa: TRY002
 
-        assert tested, "JIT Test does not execute any logic"
+        if not tested:
+            raise AssertionError("JIT Test does not execute any logic")
 
     def indiv_variant_test_jit(
         self, device, dtype, op, sample, func_type, variant, has_fake_function
@@ -188,7 +196,7 @@ class TestJit(JitCommonTestCase):
             # Note: only runs in float32 because schema isn't affected by dtype,
             #   so running it on all dtypes is would be excessive
             if dtype == torch.float32:
-                # TODO: no reason why we cant run this with tracing graph
+                # TODO: no reason why we can't run this with tracing graph
                 if support_script and op.name != "rsub":
                     check_alias_annotation(
                         name,

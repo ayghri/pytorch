@@ -25,13 +25,16 @@ struct CUDAGuardImpl final : public c10::impl::DeviceGuardImplInterface {
 
   CUDAGuardImpl() = default;
   explicit CUDAGuardImpl(DeviceType t) {
-    TORCH_INTERNAL_ASSERT(t == DeviceType::CUDA);
+    TORCH_CHECK(
+        t == DeviceType::CUDA,
+        "CUDAGuardImpl initialized with non-CUDA DeviceType: ",
+        t);
   }
   DeviceType type() const override {
     return DeviceType::CUDA;
   }
   Device exchangeDevice(Device d) const override {
-    TORCH_INTERNAL_ASSERT(d.is_cuda());
+    TORCH_CHECK(d.is_cuda(), "Expected a CUDA device, but got ", d);
     auto old_device_index = c10::cuda::ExchangeDevice(d.index());
     return Device(DeviceType::CUDA, old_device_index);
   }
@@ -50,7 +53,7 @@ struct CUDAGuardImpl final : public c10::impl::DeviceGuardImplInterface {
     return Device(DeviceType::CUDA, device);
   }
   void setDevice(Device d) const override {
-    TORCH_INTERNAL_ASSERT(d.is_cuda());
+    TORCH_CHECK(d.is_cuda(), "Expected a CUDA device, but got ", d);
     C10_CUDA_CHECK(c10::cuda::SetDevice(d.index()));
   }
   void uncheckedSetDevice(Device d) const noexcept override {
@@ -75,6 +78,10 @@ struct CUDAGuardImpl final : public c10::impl::DeviceGuardImplInterface {
     auto old_stream = getCurrentCUDAStream(s.device().index());
     setCurrentCUDAStream(cs);
     return old_stream.unwrap();
+  }
+  void* getStreamNativeHandle(const Stream s) const override {
+    CUDAStream stream{s};
+    return reinterpret_cast<void*>(stream.stream());
   }
   DeviceIndex deviceCount() const noexcept override {
     return device_count();
@@ -204,6 +211,11 @@ struct CUDAGuardImpl final : public c10::impl::DeviceGuardImplInterface {
   void synchronizeStream(const Stream& stream) const override {
     CUDAStream cuda_stream{stream};
     cuda_stream.synchronize();
+  }
+
+  bool isStreamCapturing(const Stream& stream) const override {
+    CUDAStream cuda_stream{stream};
+    return cuda_stream.is_capturing();
   }
 
   void synchronizeEvent(void* event) const override {

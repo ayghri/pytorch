@@ -6,7 +6,6 @@
 #include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/inliner.h>
-#include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 #include <torch/csrc/jit/runtime/operator.h>
 #include <fstream>
 #include <iostream>
@@ -53,7 +52,7 @@ class MutableTypePtrHelper {
   //     Tensor with shape information removed. For example, a Tensor
   //     of dimension 4 would map to the same type as a Tensor of
   //     dimension 1. This allows us to treat all subclasses of Tensor
-  //     as a single, homogenous "Tensor" type.
+  //     as a single, homogeneous "Tensor" type.
   std::optional<AliasTypeSet> mapTypeToAliasTypeSet(const TypePtr& type) {
     if (mutable_type_cache_) {
       const AliasTypeSet* result = mapTypeToBorrowedAliasTypeSet(type);
@@ -197,8 +196,6 @@ const AliasTypeSet* AliasDb::mapTypeToAliasTypeSetPtr(
   return helper.mapTypeToBorrowedAliasTypeSet(type);
 }
 
-AliasDb::~AliasDb() = default;
-
 // Structure used during analysis to keep track of all writes at a high
 // level. When the analysis is completed, this will be used to construct
 // a more efficient WriteIndex
@@ -279,13 +276,14 @@ AliasDb::AliasDb(
   // Now that we've built the write index, we can null out the WriteRegistry to
   // make future access an error. In this way we prevent the index from getting
   // out of sync (since we have no way of registering new writes)
-  // NOLINTNEXTLINE(cppcoreguidelines-prefer-member-initializer)
   writeRegistry_ = nullptr;
 
   // Initialize the write cache
   buildWrittenToLocationsIndex();
   GRAPH_DEBUG(toString());
 }
+
+AliasDb::~AliasDb() = default;
 
 bool AliasDb::isMutable(Node* n) const {
   ValueSet vs;
@@ -397,6 +395,14 @@ MemoryLocations AliasDb::getReads(Node* n) const {
   return reads;
 }
 
+MemoryLocations AliasDb::getMemoryLocations(Value* v) const {
+  auto it = elementMap_.find(v);
+  if (it != elementMap_.end()) {
+    return memoryDAG_->getMemoryLocations(it->second);
+  }
+  return MemoryLocations();
+}
+
 std::string AliasDb::getElementName(const Element* e) const {
   if (e->values.empty()) {
     // Not the most efficient way, but given the fact there are
@@ -412,14 +418,14 @@ std::string AliasDb::getElementName(const Element* e) const {
   } else {
     std::ostringstream ss;
     if (e->values.size() == 1) {
-      ss << "%" << (*e->values.begin())->debugName();
+      ss << '%' << (*e->values.begin())->debugName();
       return ss.str();
     }
-    ss << "(";
+    ss << '(';
     for (const Value* v : e->values) {
-      ss << "%" << v->debugName() << ", ";
+      ss << '%' << v->debugName() << ", ";
     }
-    ss << ")";
+    ss << ')';
     return ss.str();
   }
 }
@@ -447,7 +453,7 @@ std::string AliasDb::toString() const {
         ++ct;
         ss << getElementName(memoryDAG_->fromIndex(pointedTo));
       }
-      ss << "\n";
+      ss << '\n';
     }
     ct = 0;
     if (!element->containedElements.empty()) {
@@ -459,7 +465,7 @@ std::string AliasDb::toString() const {
         }
         ++ct;
       }
-      ss << "\n";
+      ss << '\n';
     }
   }
 
@@ -472,9 +478,9 @@ std::string AliasDb::toString() const {
     for (const auto value : values) {
       ss << getElementName(memoryDAG_->fromIndex(value)) << ", ";
     }
-    ss << "\n";
+    ss << '\n';
   }
-  ss << "\n";
+  ss << '\n';
   return ss.str();
 }
 
@@ -504,7 +510,7 @@ std::string AliasDb::toGraphviz() const {
     } else {
       std::ostringstream ss;
       if (e->values.size() == 1) {
-        ss << "\"\\%" << (*e->values.begin())->debugName() << "\"";
+        ss << "\"\\%" << (*e->values.begin())->debugName() << '"';
         return ss.str();
       }
       ss << "\"(";
@@ -531,7 +537,7 @@ std::string AliasDb::toGraphviz() const {
     if (!element->pointsTo.empty()) {
       for (const auto pointedTo : element->pointsTo) {
         dot << "  " << name(element) << " -> "
-            << name(memoryDAG_->fromIndex(pointedTo)) << "\n";
+            << name(memoryDAG_->fromIndex(pointedTo)) << '\n';
       }
     }
     if (!element->containedElements.empty()) {
@@ -2013,6 +2019,29 @@ void Lint(const AliasDb* db) {
   // fully developed.
   // - Every mutable value in the aliasdb belongs to the graph
   // - All container values have contained elements
+}
+
+ValueAndMemoryLocationSet AliasDb::getValueAndMemoryLocationSet() const {
+  return ValueAndMemoryLocationSet(this);
+}
+
+bool AliasDb::writesToAlias(Node* n, const ValueAndMemoryLocationSet& vls)
+    const {
+  const auto writtenTo = getWrites(n);
+  if (writtenTo.empty()) {
+    return false;
+  }
+
+  return writtenTo.intersects(vls.memoryLocations_);
+}
+
+void ValueAndMemoryLocationSet::insert(Value* v) {
+  valueSet_.insert(v);
+  memoryLocations_ |= aliasDb_->getMemoryLocations(v);
+}
+
+ValueSet& ValueAndMemoryLocationSet::getValueSet() {
+  return valueSet_;
 }
 
 } // namespace torch::jit

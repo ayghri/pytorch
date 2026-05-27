@@ -34,7 +34,7 @@ namespace at::native::onednn {
 
 /*
    oneDNN postops usage:
-   Currently, oneDNN supports 5 kinds of post ops. More details can be refered
+   Currently, oneDNN supports 5 kinds of post ops. More details can be referred
 to oneDNN doc.
    https://oneapi-src.github.io/oneDNN/dev_guide_attributes_post_ops.html#doxid-dev-guide-attributes-post-ops-1dev-guide-attributes-post-ops-eltwise
 
@@ -131,7 +131,7 @@ struct PostOpParam {
 
 class Attr {
  public:
-  Attr() : q_scale_(1.f), q_zero_point_(0) {}
+  Attr() : q_scale_(1.f) {}
   Attr(float q_scale, int64_t zp = 0) : q_scale_(q_scale), q_zero_point_(zp) {}
 
   /***** eltwise *****/
@@ -338,21 +338,20 @@ class Attr {
     // [1, C, 1, 1], channel broadcast
     // [dst.shape], no broadcast and eltwise-wise binary operations on dst
 
-    auto engine = GpuEngineManager::Instance().get_engine(
-        {c10::kXPU, c10::xpu::current_device()});
+    auto& engine = GpuEngineManager::Instance().get_engine();
     for (size_t i = 0; i < ops_params_.size(); ++i) {
       kind_t kind = ops_params_[i].kind_;
       if (kind == kind_t::binary) {
         dnnl::memory binary_m;
         auto binary = ops_params_[i].binary_;
         auto md = ops_params_[i].meta_;
-        // qeury expected_md to achieve peak performance
+        // query expected_md to achieve peak performance
         auto expected_md = pd.query_md(
             dnnl::query::exec_arg_md,
             DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_SRC_1);
 
         binary_m = at::native::onednn::make_onednn_memory(
-            md, engine, binary.data_ptr());
+            md, engine, binary.const_data_ptr());
 
         args.insert(
             {DNNL_ARG_ATTR_MULTIPLE_POST_OP(i) | DNNL_ARG_SRC_1, binary_m});
@@ -400,7 +399,7 @@ static inline void construct_attr_for_unary(
   } else {
     TORCH_CHECK(
         unary_post_op == "none",
-        "onednn qlinear: unspported unary post op",
+        "onednn qlinear: unsupported unary post op",
         unary_post_op);
   }
 }

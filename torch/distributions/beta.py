@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+
 import torch
 from torch import Tensor
 from torch.distributions import constraints
@@ -29,6 +30,7 @@ class Beta(ExponentialFamily):
             (often referred to as beta)
     """
 
+    # pyrefly: ignore [bad-override]
     arg_constraints = {
         "concentration1": constraints.positive,
         "concentration0": constraints.positive,
@@ -36,7 +38,12 @@ class Beta(ExponentialFamily):
     support = constraints.unit_interval
     has_rsample = True
 
-    def __init__(self, concentration1, concentration0, validate_args=None):
+    def __init__(
+        self,
+        concentration1: Tensor | float,
+        concentration0: Tensor | float,
+        validate_args: bool | None = None,
+    ) -> None:
         if isinstance(concentration1, _Number) and isinstance(concentration0, _Number):
             concentration1_concentration0 = torch.tensor(
                 [float(concentration1), float(concentration0)]
@@ -106,5 +113,6 @@ class Beta(ExponentialFamily):
     def _natural_params(self) -> tuple[Tensor, Tensor]:
         return (self.concentration1, self.concentration0)
 
+    # pyrefly: ignore [bad-override]
     def _log_normalizer(self, x, y):
         return torch.lgamma(x) + torch.lgamma(y) - torch.lgamma(x + y)

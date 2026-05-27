@@ -8,7 +8,7 @@ from torch.nn import Linear, Module
 from torch.optim import SGD
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
-from torch.testing._internal.common_fsdp import FSDPTest
+from torch.testing._internal.common_fsdp import FSDPTestContinuous
 from torch.testing._internal.common_utils import (
     parametrize,
     run_tests,
@@ -28,7 +28,7 @@ if TEST_WITH_DEV_DBG_ASAN:
     sys.exit(0)
 
 
-class TestInput(FSDPTest):
+class TestInput(FSDPTestContinuous):
     @property
     def world_size(self):
         return 1
@@ -47,7 +47,10 @@ class TestInput(FSDPTest):
                 if isinstance(input, list):
                     input = input[0]
                 else:
-                    assert isinstance(input, dict), input
+                    if not isinstance(input, dict):
+                        raise AssertionError(
+                            f"Expected dict, got {type(input)}: {input}"
+                        )
                     input = input["in"]
                 return self.layer(input)
 
@@ -70,7 +73,7 @@ class TestInput(FSDPTest):
             optim.zero_grad()
 
 
-devices = ("cuda", "hpu")
-instantiate_device_type_tests(TestInput, globals(), only_for=devices)
+devices = ("cuda", "hpu", "xpu")
+instantiate_device_type_tests(TestInput, globals(), only_for=devices, allow_xpu=True)
 if __name__ == "__main__":
     run_tests()

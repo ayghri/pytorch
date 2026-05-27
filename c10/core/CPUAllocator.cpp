@@ -154,7 +154,7 @@ class DefaultMobileCPUAllocator final : public at::Allocator {
   }
 };
 
-void NoDelete(void*) {}
+void NoDelete(void* /*unused*/) {}
 
 at::Allocator* GetCPUAllocator() {
   return GetAllocator(DeviceType::CPU);
@@ -289,7 +289,9 @@ void ProfiledCPUMemoryReporter::OutOfMemory(size_t nbytes) {
   }
 }
 
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 C10_API at::Allocator* cpu_caching_alloc = nullptr;
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 C10_API uint8_t cpu_caching_alloc_priority = 0;
 
 void SetCPUCachingAllocator(Allocator* alloc, uint8_t priority) {

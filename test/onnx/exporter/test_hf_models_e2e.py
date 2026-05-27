@@ -15,9 +15,15 @@ from torch.testing._internal import common_utils
 class DynamoExporterHfModelsTest(common_utils.TestCase):
     def export(self, model, args=(), kwargs=None, **options) -> torch.onnx.ONNXProgram:
         onnx_program = torch.onnx.export(
-            model, args, kwargs=kwargs, dynamo=True, fallback=False, **options
+            model,
+            args,
+            kwargs=kwargs,
+            dynamo=True,
+            verbose=False,
+            **options,
         )
-        assert onnx_program is not None
+        if onnx_program is None:
+            raise AssertionError("onnx_program is None")
         return onnx_program
 
     def test_onnx_export_huggingface_llm_models_with_kv_cache(self):

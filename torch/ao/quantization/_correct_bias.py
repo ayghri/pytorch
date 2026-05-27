@@ -119,10 +119,11 @@ def bias_correction(
         float_model, quantized_model, _supported_modules, MeanShadowLogger
     )
 
-    uncorrected_modules = {}
-    for name, submodule in quantized_model.named_modules():
-        if type(submodule) in target_modules:
-            uncorrected_modules[name] = submodule
+    uncorrected_modules = {
+        name: submodule
+        for name, submodule in quantized_model.named_modules()
+        if type(submodule) in target_modules
+    }
 
     for uncorrected_module in uncorrected_modules:
         quantized_submodule = get_module(quantized_model, uncorrected_module)
@@ -150,6 +151,6 @@ def bias_correction(
             bias.data = updated_bias
 
             # Resets the data contained in the loggers
-            for name, submodule in quantized_model.named_modules():
+            for submodule in quantized_model.modules():
                 if isinstance(submodule, MeanShadowLogger):
                     submodule.clear()

@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+
 import torch
 from torch import Tensor
 from torch.distributions import constraints
@@ -25,6 +26,7 @@ class Exponential(ExponentialFamily):
         rate (float or Tensor): rate = 1 / scale of the distribution
     """
 
+    # pyrefly: ignore [bad-override]
     arg_constraints = {"rate": constraints.positive}
     support = constraints.nonnegative
     has_rsample = True
@@ -46,7 +48,11 @@ class Exponential(ExponentialFamily):
     def variance(self) -> Tensor:
         return self.rate.pow(-2)
 
-    def __init__(self, rate, validate_args=None):
+    def __init__(
+        self,
+        rate: Tensor | float,
+        validate_args: bool | None = None,
+    ) -> None:
         (self.rate,) = broadcast_all(rate)
         batch_shape = torch.Size() if isinstance(rate, _Number) else self.rate.size()
         super().__init__(batch_shape, validate_args=validate_args)
@@ -83,5 +89,6 @@ class Exponential(ExponentialFamily):
     def _natural_params(self) -> tuple[Tensor]:
         return (-self.rate,)
 
+    # pyrefly: ignore [bad-override]
     def _log_normalizer(self, x):
         return -torch.log(-x)

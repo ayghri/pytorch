@@ -31,16 +31,8 @@
 
 #include <c10/macros/Macros.h>
 
-#if CUB_SUPPORTS_SCAN_BY_KEY()
-#include <thrust/iterator/reverse_iterator.h>
-#endif
-
 namespace at::native {
 
-#if !CUB_SUPPORTS_SCAN_BY_KEY()
-template<typename index_t>
-void embedding_dense_backward_cuda_scan(Tensor &sorted_indices, Tensor &count);
-#endif
 
 namespace {
 
@@ -84,9 +76,18 @@ __global__ void EmbeddingBag_updateOutputKernel_max(
       scalar_t weightFeatMax = 0;
       int64_t bag_size_ = 0;
       int64_t maxWord = -1;
+
+      // Separate validation loop reduces register pressure in the main loop below.
+      // No early exit (break) on invalid input as benchmarking shows it degrades performance.
+      bool has_invalid_index = false;
+      for (int64_t emb = begin; emb < end; emb++) {
+        index_t input_idx = input[emb];
+        has_invalid_index = has_invalid_index || (input_idx < 0 || input_idx >= numRows);
+      }
+      CUDA_KERNEL_ASSERT(!has_invalid_index && "Invalid input index in EmbeddingBag: index out of range [0, numRows)");
+
       for (int64_t emb = begin; emb < end; emb++) {
         bool pad = (input[emb] == padding_idx);
-        CUDA_KERNEL_ASSERT(input[emb] < numRows);
         const int64_t weightRow = input[emb] * weight_stride0;
         scalar_t weightValue = weightFeat[weightRow];
         if (bag_size_ == 0 || weightValue > weightFeatMax) {
@@ -135,10 +136,19 @@ __global__ void EmbeddingBag_updateOutputKernel_sum_mean(
       CUDA_KERNEL_ASSERT(end >= begin);
       accscalar_t weightFeatSum = 0;
       int64_t bag_size_ = 0;
+
+      // Separate validation loop reduces register pressure in the main loop below.
+      // No early exit (break) on invalid input as benchmarking shows it degrades performance.
+      bool has_invalid_index = false;
+      for (int64_t emb = begin; emb < end; emb++) {
+        index_t input_idx = input[emb];
+        has_invalid_index = has_invalid_index || (input_idx < 0 || input_idx >= numRows);
+      }
+      CUDA_KERNEL_ASSERT(!has_invalid_index && "Invalid input index in EmbeddingBag: index out of range [0, numRows)");
+
       for (int64_t emb = begin; emb < end; emb++) {
         index_t input_idx = input[emb];
         bool pad = (input_idx == padding_idx);
-        CUDA_KERNEL_ASSERT(0 <= input_idx && input_idx < numRows);
         const int64_t weightRow = input_idx * weight_stride0;
         scalar_t weightValue = weightFeat[weightRow];
         weightValue = pad ? static_cast<scalar_t>(0) : weightValue;
@@ -190,19 +200,18 @@ Tensor embedding_bag_backward_cuda_sum_avg(
 
   AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embedding_bag_backward_cuda_sum_avg", [&] () {
     auto range = at::arange(num_indices, indices.options());
-    // int64_t nbits = cuda::cub::get_num_bits(num_weights);
+    int64_t nbits = padding_idx >= 0
+      ? cuda::cub::get_num_bits(num_weights)
+      : cuda::cub::get_num_bits(num_weights - 1 - padding_idx);
     cuda::cub::radix_sort_pairs(
       indices.const_data_ptr<index_t>(), sorted_indices.mutable_data_ptr<index_t>(),
       range.const_data_ptr<index_t>(), orig_indices.mutable_data_ptr<index_t>(),
-      num_indices, false/*, 0, nbits*/);
+      num_indices, false, 0, nbits);
   });
 
   if (scale_grad_by_freq) {
     count = at::empty_like(indices, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
-#if CUB_SUPPORTS_SCAN_BY_KEY()
     AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embedding_bag_backward_cuda_sum_avg", [&] () {
-      cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
       // Compute an increasing sequence per unique item in sortedIndices:
       // sorted: 2 5 5 5 7 7 8 9 9
       //  count: 1 1 2 3 1 2 1 1 2
@@ -210,7 +219,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
       auto count_data = count.mutable_data_ptr<index_t>();
       cuda::cub::inclusive_sum_by_key(
         sorted_data,
-        NO_ROCM(at_cuda_detail)ROCM_HIPCUB(::cub)::ConstantInputIterator<index_t>(1),
+        ATEN_CUB_CONSTANT_ITERATOR(index_t)(1),
         count_data,
         num_indices
       );
@@ -219,18 +228,13 @@ Tensor embedding_bag_backward_cuda_sum_avg(
       // sorted: 2 5 5 5 7 7 8 9 9
       //  count: 1 3 3 3 2 2 1 2 2
       cuda::cub::inclusive_scan_by_key(
-        thrust::make_reverse_iterator(sorted_data + num_indices),
-        thrust::make_reverse_iterator(count_data + num_indices),
-        thrust::make_reverse_iterator(count_data + num_indices),
-        NO_ROCM(at_cuda_detail)ROCM_HIPCUB(::cub)::Max(),
+        cccl_make_reverse_iterator(sorted_data + num_indices),
+        cccl_make_reverse_iterator(count_data + num_indices),
+        cccl_make_reverse_iterator(count_data + num_indices),
+        ATEN_CUB_MAXIMUM(),
         num_indices
       );
     });
-#else
-    AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embedding_bag_backward_cuda_sum_avg", [&] () {
-      embedding_dense_backward_cuda_scan<index_t>(sorted_indices, count);
-    });
-#endif
   }
   return embedding_backward_cuda_kernel(grad, orig_indices, sorted_indices,
       count, num_weights, padding_idx, mode == EmbeddingBagMode::MEAN, offset2bag,
@@ -414,7 +418,7 @@ _embedding_bag_cuda(const Tensor &weight, const Tensor &indices_,
             weight.const_data_ptr<scalar_t>(), output.mutable_data_ptr<scalar_t>(),
             offset2bag.mutable_data_ptr<index_t>(), numIndices, numBags, featureSize,
             weight.stride(0), weight.stride(1), mode, bag_size.mutable_data_ptr<index_t>(),
-            per_sample_weights.defined() ? per_sample_weights.const_data_ptr<scalar_t>() : NULL,
+            per_sample_weights.defined() ? per_sample_weights.const_data_ptr<scalar_t>() : nullptr,
             per_sample_weights.defined() ? per_sample_weights.stride(0) : 0,
             padding_idx, weight.size(0));
         C10_CUDA_KERNEL_LAUNCH_CHECK();

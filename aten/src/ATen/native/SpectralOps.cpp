@@ -58,7 +58,6 @@
 #include <ATen/ops/view_as_complex.h>
 #include <ATen/ops/view_as_real.h>
 #include <ATen/ops/zeros.h>
-#include <ATen/ops/zeros_like_ops.h>
 #endif
 
 #include <algorithm>
@@ -81,9 +80,9 @@ ScalarType promote_type_fft(ScalarType type, bool require_complex, Device device
   }
 
   const bool maybe_support_half = (
-    // Only CUDA supports half precision, but since meta tensors don't have a
+    // CUDA and XPU support half precision, but since meta tensors don't have a
     // device we err on the side of accepting it
-    device.is_cuda() || device.is_meta()
+    device.is_cuda() || device.is_meta() || device.is_xpu()
   );
   if (maybe_support_half) {
     TORCH_CHECK(type == kHalf || type == kFloat || type == kDouble, "Unsupported dtype ", type);
@@ -756,7 +755,7 @@ static DimVector default_alldims(const Tensor& self, at::OptionalIntArrayRef dim
     IntArrayRef dim_unwrapped = *dim_opt;
     dim.resize(dim_unwrapped.size());
     for (const auto i : c10::irange(dim.size())) {
-      dim[i] = maybe_wrap_dim(dim_unwrapped[i], self.dim(), /*wrap_scalars=*/false);
+      dim[i] = maybe_wrap_dim(dim_unwrapped[i], self.dim(), /*wrap_scalar=*/false);
     }
   } else {
     dim.resize(self.dim());
@@ -837,7 +836,7 @@ Tensor stft(const Tensor& self, const int64_t n_fft, const std::optional<int64_t
         "A window was not provided. A rectangular window will be applied,"
         "which is known to cause spectral leakage. "
         "Other windows such as torch.hann_window or torch.hamming_window "
-        "can are recommended to reduce spectral leakage."
+        "are recommended to reduce spectral leakage."
         "To suppress this warning and use a rectangular window, explicitly set "
         "`window=torch.ones(n_fft, device=<device>)`.");
   }
@@ -847,7 +846,7 @@ Tensor stft(const Tensor& self, const int64_t n_fft, const std::optional<int64_t
        << ", hop_length=" << hop_length << ", win_length=" << win_length \
        << ", window="; \
     if (window.defined()) { \
-      SS << window.toString() << "{" << window.sizes() << "}"; \
+      SS << window.toString() << '{' << window.sizes() << '}'; \
     } else { \
       SS << "None"; \
     } \
@@ -1046,7 +1045,7 @@ Tensor istft(const Tensor& self, const int64_t n_fft, const std::optional<int64_
        << ", hop_length=" << hop_length << ", win_length=" << win_length \
        << ", window="; \
     if (window.defined()) { \
-      SS << window.toString() << "{" << window.sizes() << "}"; \
+      SS << window.toString() << '{' << window.sizes() << '}'; \
     } else { \
       SS << "None"; \
     } \

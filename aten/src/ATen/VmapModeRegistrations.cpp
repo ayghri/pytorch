@@ -1,5 +1,4 @@
 #include <torch/library.h>
-#include <ATen/core/boxing/KernelFunction.h>
 
 using torch::CppFunction;
 
@@ -20,12 +19,12 @@ namespace at {
 // We haven't made a decision on that yet so we are temporarily banning random
 // operations inside of vmap while we gather user feedback.
 
-template <typename... Args> Tensor unsupportedRandomOp(Args... args) {
+template <typename... Args> static Tensor unsupportedRandomOp(Args... args) {
   TORCH_CHECK(false, "vmap: We do not yet support calling random operations inside of vmap. ",
               "Please perform random operations outside of vmap as a workaround");
 }
 
-template <typename... Args> Tensor& unsupportedRandomOp_(Args... args) {
+template <typename... Args> static Tensor& unsupportedRandomOp_(Args... args) {
   TORCH_CHECK(false, "vmap: We do not yet support calling random operations inside of vmap. ",
               "Please perform random operations outside of vmap as a workaround");
 }
@@ -72,10 +71,16 @@ TORCH_LIBRARY_IMPL(aten, VmapMode, m) {
   m.impl("random_", unsupportedRandomOp_<Tensor&, std::optional<Generator>>);
 
   m.impl("rand_like", unsupportedRandomOp<const Tensor&, TENSOROPTIONS, std::optional<MemoryFormat>>);
+  m.impl("rand_like.generator", unsupportedRandomOp<const Tensor&, std::optional<Generator>, TENSOROPTIONS, std::optional<MemoryFormat>>);
   m.impl("randn_like", unsupportedRandomOp<const Tensor&, TENSOROPTIONS, std::optional<MemoryFormat>>);
+  m.impl("randn_like.generator", unsupportedRandomOp<const Tensor&, std::optional<Generator>, TENSOROPTIONS, std::optional<MemoryFormat>>);
 
   m.impl("randint_like", unsupportedRandomOp<const Tensor&, int64_t, TENSOROPTIONS, std::optional<MemoryFormat>>);
+  m.impl("randint_like.Tensor", unsupportedRandomOp<const Tensor&, const Tensor&, TENSOROPTIONS, std::optional<MemoryFormat>>);
   m.impl("randint_like.low_dtype", unsupportedRandomOp<const Tensor&, int64_t, int64_t, TENSOROPTIONS, std::optional<MemoryFormat>>);
+  m.impl("randint_like.generator", unsupportedRandomOp<const Tensor&, int64_t, std::optional<Generator>, TENSOROPTIONS, std::optional<MemoryFormat>>);
+  m.impl("randint_like.Tensor_generator", unsupportedRandomOp<const Tensor&, const Tensor&, std::optional<Generator>, TENSOROPTIONS, std::optional<MemoryFormat>>);
+  m.impl("randint_like.low_generator_dtype", unsupportedRandomOp<const Tensor&, int64_t, int64_t, std::optional<Generator>, TENSOROPTIONS, std::optional<MemoryFormat>>);
 
   m.impl("rand", unsupportedRandomOp<IntArrayRef, TENSOROPTIONS>);
   m.impl("rand.generator", unsupportedRandomOp<IntArrayRef, std::optional<Generator>, TENSOROPTIONS>);
